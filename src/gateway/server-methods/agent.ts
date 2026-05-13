@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import {
   listAgentIds,
   resolveDefaultAgentId,
@@ -14,7 +13,6 @@ import {
   resolveAgentAvatar,
   resolvePublicAgentAvatarSource,
 } from "../../agents/identity-avatar.js";
-import { AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION } from "../../agents/internal-event-contract.js";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
 import { resolveTrustedGroupId } from "../../agents/pi-tools.policy.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
@@ -40,14 +38,13 @@ import {
   resolveAgentIdFromSessionKey,
   resolveExplicitAgentSessionKey,
   resolveAgentMainSessionKey,
-  resolveSessionFilePath,
-  resolveSessionFilePathOptions,
   resolveSessionLifecycleTimestamps,
   resolveSessionResetPolicy,
   resolveSessionResetType,
   type SessionEntry,
-  updateSessionStore,
+  upsertSessionEntry,
 } from "../../config/sessions.js";
+import { readSqliteSessionRoutingInfo } from "../../config/sessions/session-entries.sqlite.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { formatUncaughtError } from "../../infra/errors.js";
@@ -76,10 +73,6 @@ import {
   type InputProvenance,
 } from "../../sessions/input-provenance.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
-import {
-  parseRawSessionConversationRef,
-  parseThreadSessionSuffix,
-} from "../../sessions/session-key-utils.js";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
@@ -130,7 +123,7 @@ import {
   canonicalizeSpawnedByForAgent,
   loadGatewaySessionRow,
   loadSessionEntry,
-  migrateAndPruneGatewaySessionStoreKey,
+  parseGroupKey,
   resolveGatewayModelSupportsImages,
   resolveSessionModelRef,
 } from "../session-utils.js";
@@ -165,6 +158,17 @@ function formatAttachmentFailureForLog(err: unknown): string {
   return `${primary}\nCaused by: ${causeText}`;
 }
 
+function shouldSuppressPromptPersistenceForAgentRun(params: {
+  inputProvenance?: InputProvenance;
+  internalEvents?: AgentInternalEvent[];
+}): boolean {
+  return (
+    params.inputProvenance?.kind === "inter_session" &&
+    params.inputProvenance.sourceTool === "subagent_announce" &&
+    params.internalEvents?.some((event) => event.type === "task_completion") === true
+  );
+}
+
 function logAttachmentFailure(
   logGateway: Pick<GatewayRequestContext["logGateway"], "error">,
   label: string,
@@ -176,7 +180,7 @@ function logAttachmentFailure(
   });
 }
 
-function clientHasAdminScope(client: GatewayRequestHandlerOptions["client"]): boolean {
+function resolveSenderIsOwnerFromClient(client: GatewayRequestHandlerOptions["client"]): boolean {
   const scopes = Array.isArray(client?.connect?.scopes) ? client.connect.scopes : [];
   return scopes.includes(ADMIN_SCOPE);
 }
@@ -184,11 +188,11 @@ function clientHasAdminScope(client: GatewayRequestHandlerOptions["client"]): bo
 function resolveAllowModelOverrideFromClient(
   client: GatewayRequestHandlerOptions["client"],
 ): boolean {
-  return clientHasAdminScope(client) || client?.internal?.allowModelOverride === true;
+  return resolveSenderIsOwnerFromClient(client) || client?.internal?.allowModelOverride === true;
 }
 
 function resolveCanResetSessionFromClient(client: GatewayRequestHandlerOptions["client"]): boolean {
-  return clientHasAdminScope(client);
+  return resolveSenderIsOwnerFromClient(client);
 }
 
 function resolveCanUseInternalRuntimeHandoff(
@@ -283,29 +287,37 @@ function normalizeTrustedGroupMetadata(value?: {
   };
 }
 
-function resolveSessionKeyGroupId(sessionKey: string): string | undefined {
-  const { baseSessionKey } = parseThreadSessionSuffix(sessionKey);
-  const conversation = parseRawSessionConversationRef(baseSessionKey ?? sessionKey);
-  if (!conversation || (conversation.kind !== "group" && conversation.kind !== "channel")) {
-    return undefined;
-  }
-  return conversation.rawId;
+function groupIdsEqual(left?: string, right?: string): boolean {
+  return Boolean(left && right && left.toLowerCase() === right.toLowerCase());
 }
 
 function resolveTrustedGroupMetadata(params: {
-  sessionKey: string;
-  spawnedBy?: string;
+  typedGroupId?: string;
   stored: TrustedGroupMetadata;
   inherited?: TrustedGroupMetadata;
 }): TrustedGroupMetadata {
+  const inheritedMatchesTyped =
+    params.inherited?.groupId &&
+    (!params.typedGroupId || groupIdsEqual(params.inherited.groupId, params.typedGroupId));
+  const trustedGroupId = params.typedGroupId ?? params.inherited?.groupId;
+  const storedMatchesTrusted =
+    params.stored.groupId && trustedGroupId && groupIdsEqual(params.stored.groupId, trustedGroupId);
+  const groupId = storedMatchesTrusted
+    ? params.stored.groupId
+    : inheritedMatchesTyped
+      ? params.inherited?.groupId
+      : trustedGroupId;
+  if (!groupId) {
+    return {};
+  }
   return {
-    groupId:
-      params.stored.groupId ??
-      params.inherited?.groupId ??
-      resolveSessionKeyGroupId(params.sessionKey) ??
-      (params.spawnedBy ? resolveSessionKeyGroupId(params.spawnedBy) : undefined),
-    groupChannel: params.stored.groupChannel ?? params.inherited?.groupChannel,
-    groupSpace: params.stored.groupSpace ?? params.inherited?.groupSpace,
+    groupId,
+    groupChannel:
+      (storedMatchesTrusted ? params.stored.groupChannel : undefined) ??
+      (inheritedMatchesTyped ? params.inherited?.groupChannel : undefined),
+    groupSpace:
+      (storedMatchesTrusted ? params.stored.groupSpace : undefined) ??
+      (inheritedMatchesTyped ? params.inherited?.groupSpace : undefined),
   };
 }
 
@@ -317,7 +329,7 @@ function requestGroupMatchesTrusted(params: {
   if (!requestGroupId) {
     return true;
   }
-  return Boolean(params.trustedGroupId && requestGroupId === params.trustedGroupId);
+  return groupIdsEqual(requestGroupId, params.trustedGroupId);
 }
 
 function emitSessionsChanged(
@@ -347,7 +359,6 @@ function emitSessionsChanged(
             groupChannel: sessionRow.groupChannel,
             space: sessionRow.space,
             chatType: sessionRow.chatType,
-            origin: sessionRow.origin,
             spawnedBy: sessionRow.spawnedBy,
             spawnedWorkspaceDir: sessionRow.spawnedWorkspaceDir,
             forkedFromParent: sessionRow.forkedFromParent,
@@ -359,6 +370,10 @@ function emitSessionsChanged(
             deliveryContext: sessionRow.deliveryContext,
             parentSessionKey: sessionRow.parentSessionKey,
             childSessions: sessionRow.childSessions,
+            lastChannel: sessionRow.lastChannel,
+            lastTo: sessionRow.lastTo,
+            lastAccountId: sessionRow.lastAccountId,
+            lastThreadId: sessionRow.lastThreadId,
             thinkingLevel: sessionRow.thinkingLevel,
             fastMode: sessionRow.fastMode,
             verboseLevel: sessionRow.verboseLevel,
@@ -370,10 +385,6 @@ function emitSessionsChanged(
             abortedLastRun: sessionRow.abortedLastRun,
             inputTokens: sessionRow.inputTokens,
             outputTokens: sessionRow.outputTokens,
-            lastChannel: sessionRow.lastChannel,
-            lastTo: sessionRow.lastTo,
-            lastAccountId: sessionRow.lastAccountId,
-            lastThreadId: sessionRow.lastThreadId,
             totalTokens: sessionRow.totalTokens,
             totalTokensFresh: sessionRow.totalTokensFresh,
             contextTokens: sessionRow.contextTokens,
@@ -475,6 +486,7 @@ function deleteGatewayDedupeEntries(params: {
 function dispatchAgentRunFromGateway(params: {
   ingressOpts: Parameters<typeof agentCommandFromIngress>[0];
   runId: string;
+  idempotencyKey: string;
   dedupeKeys: readonly string[];
   /**
    * Controller whose signal is wired into `ingressOpts.abortSignal`. Used on
@@ -582,24 +594,6 @@ function dispatchAgentRunFromGateway(params: {
     });
 }
 
-function shouldSuppressAgentPromptPersistence(params: {
-  inputProvenance?: InputProvenance;
-  internalEvents?: AgentInternalEvent[];
-}): boolean {
-  if (
-    params.inputProvenance?.kind !== "inter_session" ||
-    params.inputProvenance.sourceTool !== "subagent_announce"
-  ) {
-    return false;
-  }
-  return (
-    params.internalEvents?.some(
-      (event) =>
-        event.type === AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION && event.source === "subagent",
-    ) === true
-  );
-}
-
 function yieldAfterAgentAcceptedAck(): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, 10);
@@ -661,9 +655,15 @@ export const agentHandlers: GatewayRequestHandlers = {
       cleanupBundleMcpOnRunEnd?: boolean;
       label?: string;
       inputProvenance?: InputProvenance;
+      initialVfsEntries?: Array<{
+        path: string;
+        contentBase64: string;
+        metadata?: Record<string, unknown>;
+      }>;
       workspaceDir?: string;
       voiceWakeTrigger?: string;
     };
+    const senderIsOwner = resolveSenderIsOwnerFromClient(client);
     const allowModelOverride = resolveAllowModelOverrideFromClient(client);
     const canResetSession = resolveCanResetSessionFromClient(client);
     const canUseInternalRuntimeHandoff = resolveCanUseInternalRuntimeHandoff(client);
@@ -721,6 +721,14 @@ export const agentHandlers: GatewayRequestHandlers = {
       });
       return;
     }
+    const activeRun = context.chatAbortControllers.get(idem);
+    if (activeRun) {
+      respond(true, { runId: idem, status: "in_flight" }, undefined, {
+        cached: true,
+        runId: idem,
+      });
+      return;
+    }
     let agentDedupeReserved = false;
     let agentRunAccepted = false;
     const reserveExecApprovalFollowupDedupe = () => {
@@ -771,8 +779,11 @@ export const agentHandlers: GatewayRequestHandlers = {
       let baseProvider: string | undefined;
       let baseModel: string | undefined;
       if (requestedSessionKeyRaw) {
-        const { cfg: sessCfg, entry: sessEntry } = loadSessionEntry(requestedSessionKeyRaw);
-        const sessionAgentId = resolveAgentIdFromSessionKey(requestedSessionKeyRaw);
+        const {
+          cfg: sessCfg,
+          entry: sessEntry,
+          agentId: sessionAgentId,
+        } = loadSessionEntry(requestedSessionKeyRaw);
         const modelRef = resolveSessionModelRef(sessCfg, sessEntry, sessionAgentId);
         baseProvider = modelRef.provider;
         baseModel = modelRef.model;
@@ -898,798 +909,779 @@ export const agentHandlers: GatewayRequestHandlers = {
     // Reserve the stable alias before awaited session/delivery work so overlaps dedupe.
     reserveExecApprovalFollowupDedupe();
     try {
-      const voiceWakeTrigger = normalizeOptionalString(request.voiceWakeTrigger) ?? "";
-      const replyTo = normalizeOptionalString(request.replyTo) ?? "";
-      const to = normalizeOptionalString(request.to) ?? "";
-      const explicitVoiceWakeSessionTarget =
-        !agentId && requestedSessionKeyRaw
-          ? (() => {
-              const { cfg: sessionCfg, canonicalKey } = loadSessionEntry(requestedSessionKeyRaw);
-              const routedAgentId = resolveAgentIdFromSessionKey(canonicalKey);
-              const defaultAgentId = normalizeAgentId(resolveDefaultAgentId(sessionCfg));
-              if (routedAgentId !== defaultAgentId) {
-                return true;
-              }
-              const mainSessionKey = resolveAgentMainSessionKey({
-                cfg: sessionCfg,
-                agentId: routedAgentId,
-              });
-              return canonicalKey !== mainSessionKey;
-            })()
-          : false;
-      const canAutoRouteVoiceWake =
-        !agentId && !explicitVoiceWakeSessionTarget && !requestedSessionId && !replyTo && !to;
-      const hasVoiceWakeTriggerField = Object.prototype.hasOwnProperty.call(
-        request,
-        "voiceWakeTrigger",
-      );
-      if (hasVoiceWakeTriggerField && canAutoRouteVoiceWake) {
-        try {
-          const routingConfig = await loadVoiceWakeRoutingConfig();
-          const route = resolveVoiceWakeRouteByTrigger({
-            trigger: voiceWakeTrigger || undefined,
-            config: routingConfig,
-          });
-          if ("agentId" in route) {
-            if (knownAgents.includes(route.agentId)) {
-              agentId = route.agentId;
-              requestedSessionKey = resolveExplicitAgentSessionKey({
-                cfg,
-                agentId,
-              });
-            } else {
-              context.logGateway.warn(
-                `voicewake routing ignored unknown agentId="${route.agentId}" trigger="${voiceWakeTrigger}"`,
-              );
+    const voiceWakeTrigger = normalizeOptionalString(request.voiceWakeTrigger) ?? "";
+    const replyTo = normalizeOptionalString(request.replyTo) ?? "";
+    const to = normalizeOptionalString(request.to) ?? "";
+    const explicitVoiceWakeSessionTarget =
+      !agentId && requestedSessionKeyRaw
+        ? (() => {
+            const { cfg: sessionCfg, canonicalKey } = loadSessionEntry(requestedSessionKeyRaw);
+            const routedAgentId = resolveAgentIdFromSessionKey(canonicalKey);
+            const defaultAgentId = normalizeAgentId(resolveDefaultAgentId(sessionCfg));
+            if (routedAgentId !== defaultAgentId) {
+              return true;
             }
-          } else if ("sessionKey" in route) {
-            if (classifySessionKeyShape(route.sessionKey) !== "malformed_agent") {
-              const canonicalRouteSession = loadSessionEntry(route.sessionKey).canonicalKey;
-              const routedAgentId = resolveAgentIdFromSessionKey(canonicalRouteSession);
-              if (knownAgents.includes(routedAgentId)) {
-                requestedSessionKey = canonicalRouteSession;
-                agentId = routedAgentId;
-              } else {
-                context.logGateway.warn(
-                  `voicewake routing ignored unknown session agent="${routedAgentId}" sessionKey="${canonicalRouteSession}" trigger="${voiceWakeTrigger}"`,
-                );
-              }
-            } else {
-              context.logGateway.warn(
-                `voicewake routing ignored malformed sessionKey="${route.sessionKey}" trigger="${voiceWakeTrigger}"`,
-              );
-            }
-          }
-        } catch (err) {
-          context.logGateway.warn(`voicewake routing load failed: ${formatForLog(err)}`);
-        }
-      }
-      let resolvedSessionId = requestedSessionId;
-      let sessionEntry: SessionEntry | undefined;
-      let bestEffortDeliver = requestedBestEffortDeliver ?? false;
-      let cfgForAgent: OpenClawConfig | undefined;
-      let resolvedSessionKey = requestedSessionKey;
-      let isNewSession = false;
-      let skipTimestampInjection = false;
-      let shouldPrependStartupContext = false;
-
-      const resetCommandMatch = message.match(RESET_COMMAND_RE);
-      if (resetCommandMatch && requestedSessionKey) {
-        if (!canResetSession) {
-          respond(
-            false,
-            undefined,
-            errorShape(ErrorCodes.INVALID_REQUEST, `missing scope: ${ADMIN_SCOPE}`),
-          );
-          return;
-        }
-        const resetReason =
-          normalizeOptionalLowercaseString(resetCommandMatch[1]) === "new" ? "new" : "reset";
-        const resetResult = await runSessionResetFromAgent({
-          key: requestedSessionKey,
-          reason: resetReason,
+            const mainSessionKey = resolveAgentMainSessionKey({
+              cfg: sessionCfg,
+              agentId: routedAgentId,
+            });
+            return canonicalKey !== mainSessionKey;
+          })()
+        : false;
+    const canAutoRouteVoiceWake =
+      !agentId && !explicitVoiceWakeSessionTarget && !requestedSessionId && !replyTo && !to;
+    const hasVoiceWakeTriggerField = Object.prototype.hasOwnProperty.call(
+      request,
+      "voiceWakeTrigger",
+    );
+    if (hasVoiceWakeTriggerField && canAutoRouteVoiceWake) {
+      try {
+        const routingConfig = await loadVoiceWakeRoutingConfig();
+        const route = resolveVoiceWakeRouteByTrigger({
+          trigger: voiceWakeTrigger || undefined,
+          config: routingConfig,
         });
-        if (!resetResult.ok) {
-          respond(false, undefined, resetResult.error);
-          return;
+        if ("agentId" in route) {
+          if (knownAgents.includes(route.agentId)) {
+            agentId = route.agentId;
+            requestedSessionKey = resolveExplicitAgentSessionKey({
+              cfg,
+              agentId,
+            });
+          } else {
+            context.logGateway.warn(
+              `voicewake routing ignored unknown agentId="${route.agentId}" trigger="${voiceWakeTrigger}"`,
+            );
+          }
+        } else if ("sessionKey" in route) {
+          if (classifySessionKeyShape(route.sessionKey) !== "malformed_agent") {
+            const canonicalRouteSession = loadSessionEntry(route.sessionKey).canonicalKey;
+            const routedAgentId = resolveAgentIdFromSessionKey(canonicalRouteSession);
+            if (knownAgents.includes(routedAgentId)) {
+              requestedSessionKey = canonicalRouteSession;
+              agentId = routedAgentId;
+            } else {
+              context.logGateway.warn(
+                `voicewake routing ignored unknown session agent="${routedAgentId}" sessionKey="${canonicalRouteSession}" trigger="${voiceWakeTrigger}"`,
+              );
+            }
+          } else {
+            context.logGateway.warn(
+              `voicewake routing ignored malformed sessionKey="${route.sessionKey}" trigger="${voiceWakeTrigger}"`,
+            );
+          }
         }
-        requestedSessionKey = resetResult.key;
-        resolvedSessionId = resetResult.sessionId ?? resolvedSessionId;
-        const postResetMessage = normalizeOptionalString(resetCommandMatch[2]) ?? "";
-        if (postResetMessage) {
-          message = postResetMessage;
-        } else {
-          const resetLoadedSession = loadSessionEntry(requestedSessionKey);
-          const resetCfg = resetLoadedSession?.cfg ?? cfg;
-          const resetSessionEntry = resetLoadedSession?.entry;
-          const resetSpawnedBy = canonicalizeSpawnedByForAgent(
-            resetCfg,
-            resolveAgentIdFromSessionKey(requestedSessionKey),
-            resetSessionEntry?.spawnedBy,
-          );
-          const { runtimeWorkspaceDir, isCanonicalWorkspace } = resolveSessionRuntimeWorkspace({
+      } catch (err) {
+        context.logGateway.warn(`voicewake routing load failed: ${formatForLog(err)}`);
+      }
+    }
+    let resolvedSessionId = requestedSessionId;
+    let sessionEntry: SessionEntry | undefined;
+    let bestEffortDeliver = requestedBestEffortDeliver ?? false;
+    let cfgForAgent: OpenClawConfig | undefined;
+    let resolvedSessionKey = requestedSessionKey;
+    let isNewSession = false;
+    let skipTimestampInjection = false;
+    let shouldPrependStartupContext = false;
+
+    const resetCommandMatch = message.match(RESET_COMMAND_RE);
+    if (resetCommandMatch && requestedSessionKey) {
+      if (!canResetSession) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, `missing scope: ${ADMIN_SCOPE}`),
+        );
+        return;
+      }
+      const resetReason =
+        normalizeOptionalLowercaseString(resetCommandMatch[1]) === "new" ? "new" : "reset";
+      const resetResult = await runSessionResetFromAgent({
+        key: requestedSessionKey,
+        reason: resetReason,
+      });
+      if (!resetResult.ok) {
+        respond(false, undefined, resetResult.error);
+        return;
+      }
+      requestedSessionKey = resetResult.key;
+      resolvedSessionId = resetResult.sessionId ?? resolvedSessionId;
+      const postResetMessage = normalizeOptionalString(resetCommandMatch[2]) ?? "";
+      if (postResetMessage) {
+        message = postResetMessage;
+      } else {
+        const resetLoadedSession = loadSessionEntry(requestedSessionKey);
+        const resetCfg = resetLoadedSession?.cfg ?? cfg;
+        const resetSessionEntry = resetLoadedSession?.entry;
+        const resetSpawnedBy = canonicalizeSpawnedByForAgent(
+          resetCfg,
+          resolveAgentIdFromSessionKey(requestedSessionKey),
+          resetSessionEntry?.spawnedBy,
+        );
+        const { runtimeWorkspaceDir, isCanonicalWorkspace } = resolveSessionRuntimeWorkspace({
+          cfg: resetCfg,
+          sessionKey: requestedSessionKey,
+          sessionEntry: resetSessionEntry,
+          spawnedBy: resetSpawnedBy,
+        });
+        const resetSessionAgentId = resolveAgentIdFromSessionKey(requestedSessionKey);
+        const resetBaseModelRef = resolveSessionModelRef(
+          resetCfg,
+          resetSessionEntry,
+          resetSessionAgentId,
+        );
+        const resetEffectiveModelRef = {
+          provider: providerOverride || resetBaseModelRef.provider,
+          model: modelOverride || resetBaseModelRef.model,
+        };
+        const bareResetPromptState = await resolveBareSessionResetPromptState({
+          cfg: resetCfg,
+          workspaceDir: runtimeWorkspaceDir,
+          isPrimaryRun:
+            !isSubagentSessionKey(requestedSessionKey) && !isAcpSessionKey(requestedSessionKey),
+          isCanonicalWorkspace,
+          hasBootstrapFileAccess: resolveBareResetBootstrapFileAccess({
             cfg: resetCfg,
+            agentId: resetSessionAgentId,
             sessionKey: requestedSessionKey,
-            sessionEntry: resetSessionEntry,
-            spawnedBy: resetSpawnedBy,
-          });
-          const resetSessionAgentId = resolveAgentIdFromSessionKey(requestedSessionKey);
-          const resetBaseModelRef = resolveSessionModelRef(
-            resetCfg,
-            resetSessionEntry,
-            resetSessionAgentId,
-          );
-          const resetEffectiveModelRef = {
-            provider: providerOverride || resetBaseModelRef.provider,
-            model: modelOverride || resetBaseModelRef.model,
-          };
-          const bareResetPromptState = await resolveBareSessionResetPromptState({
-            cfg: resetCfg,
             workspaceDir: runtimeWorkspaceDir,
-            isPrimaryRun:
-              !isSubagentSessionKey(requestedSessionKey) && !isAcpSessionKey(requestedSessionKey),
-            isCanonicalWorkspace,
-            hasBootstrapFileAccess: resolveBareResetBootstrapFileAccess({
-              cfg: resetCfg,
-              agentId: resetSessionAgentId,
-              sessionKey: requestedSessionKey,
-              workspaceDir: runtimeWorkspaceDir,
-              modelProvider: resetEffectiveModelRef.provider,
-              modelId: resetEffectiveModelRef.model,
-            }),
-          });
-          // Keep bare /new and /reset behavior aligned with chat.send:
-          // reset first, then run a fresh-session greeting prompt in-place.
-          // Date is embedded in the prompt so agents read the correct daily
-          // memory files; skip further timestamp injection to avoid duplication.
-          message = bareResetPromptState.prompt;
-          skipTimestampInjection = true;
-          shouldPrependStartupContext =
-            bareResetPromptState.shouldPrependStartupContext &&
-            shouldApplyStartupContext({ cfg, action: resetReason });
-        }
-      }
-
-      // Inject timestamp into user-authored messages that don't already have one.
-      // Channel messages (Discord, Telegram, etc.) get timestamps via envelope
-      // formatting in a separate code path — they never reach this handler.
-      // See: https://github.com/openclaw/openclaw/issues/3658
-      if (!skipTimestampInjection && !isRawModelRun && inputProvenance?.kind !== "inter_session") {
-        message = injectTimestamp(message, timestampOptsFromConfig(cfg));
-      }
-
-      if (requestedSessionKey) {
-        const { cfg, storePath, entry, canonicalKey } = loadSessionEntry(requestedSessionKey);
-        cfgForAgent = cfg;
-        const now = Date.now();
-        const resetPolicy = resolveSessionResetPolicy({
-          sessionCfg: cfg.session,
-          resetType: resolveSessionResetType({ sessionKey: canonicalKey }),
-          resetOverride: resolveChannelResetConfig({
-            sessionCfg: cfg.session,
-            channel: entry?.lastChannel ?? entry?.channel ?? request.channel,
+            modelProvider: resetEffectiveModelRef.provider,
+            modelId: resetEffectiveModelRef.model,
           }),
         });
-        const freshness = entry
-          ? evaluateSessionFreshness({
-              updatedAt: entry.updatedAt,
-              ...resolveSessionLifecycleTimestamps({
-                entry,
-                storePath,
-                agentId: resolveAgentIdFromSessionKey(canonicalKey),
-              }),
-              now,
-              policy: resetPolicy,
-            })
-          : undefined;
-        let failedSessionTranscriptMissing = false;
-        if (entry?.status === "failed" && entry.sessionId?.trim()) {
-          try {
-            const sessionPathOpts = resolveSessionFilePathOptions({
-              storePath,
-              agentId: resolveAgentIdFromSessionKey(canonicalKey),
-            });
-            failedSessionTranscriptMissing = !existsSync(
-              resolveSessionFilePath(entry.sessionId, entry, sessionPathOpts),
-            );
-          } catch {
-            failedSessionTranscriptMissing = true;
-          }
-        }
-        const canReuseSession =
-          Boolean(entry?.sessionId) &&
-          (freshness?.fresh ?? false) &&
-          !failedSessionTranscriptMissing;
-        const usableRequestedSessionId =
-          requestedSessionId && (!entry?.sessionId || canReuseSession)
-            ? requestedSessionId
-            : undefined;
-        const sessionId = usableRequestedSessionId
-          ? usableRequestedSessionId
-          : ((canReuseSession ? entry?.sessionId : undefined) ?? randomUUID());
-        isNewSession =
-          !entry ||
-          (!canReuseSession && !usableRequestedSessionId) ||
-          Boolean(usableRequestedSessionId && entry?.sessionId !== usableRequestedSessionId);
-        const rotatedSessionId = Boolean(entry?.sessionId && entry.sessionId !== sessionId);
-        const touchInteraction =
-          request.bootstrapContextRunKind !== "cron" &&
-          request.bootstrapContextRunKind !== "heartbeat" &&
-          !request.internalEvents?.length;
-        const labelValue = normalizeOptionalString(request.label) || entry?.label;
-        const pluginOwnerId =
-          entry === undefined
-            ? normalizeOptionalString(client?.internal?.pluginRuntimeOwnerId)
-            : normalizeOptionalString(entry.pluginOwnerId);
-        const sessionAgent = resolveAgentIdFromSessionKey(canonicalKey);
-        spawnedByValue = canonicalizeSpawnedByForAgent(cfg, sessionAgent, entry?.spawnedBy);
-        const storedGroup = normalizeTrustedGroupMetadata(entry);
-        let inheritedGroup: TrustedGroupMetadata | undefined;
-        if (
-          spawnedByValue &&
-          (!storedGroup.groupId || !storedGroup.groupChannel || !storedGroup.groupSpace)
-        ) {
-          try {
-            const parentEntry = loadSessionEntry(spawnedByValue)?.entry;
-            inheritedGroup = normalizeTrustedGroupMetadata({
-              groupId: parentEntry?.groupId,
-              groupChannel: parentEntry?.groupChannel,
-              groupSpace: parentEntry?.space,
-            });
-          } catch {
-            inheritedGroup = undefined;
-          }
-        }
-        const trustedGroup = resolveTrustedGroupMetadata({
-          sessionKey: canonicalKey,
-          spawnedBy: spawnedByValue,
-          stored: storedGroup,
-          inherited: inheritedGroup,
-        });
-        const validatedGroup = trustedGroup.groupId
-          ? resolveTrustedGroupId({
-              groupId: trustedGroup.groupId,
-              sessionKey: canonicalKey,
-              spawnedBy: spawnedByValue,
-            })
-          : undefined;
-        if (validatedGroup?.dropped) {
-          resolvedGroupId = undefined;
-          resolvedGroupChannel = undefined;
-          resolvedGroupSpace = undefined;
-        } else {
-          const trustRequestSelectors =
-            Boolean(trustedGroup.groupId) &&
-            requestGroupMatchesTrusted({
-              requestGroupId: normalizedSpawned.groupId,
-              trustedGroupId: trustedGroup.groupId,
-            });
-          resolvedGroupId = trustedGroup.groupId;
-          resolvedGroupChannel =
-            trustedGroup.groupChannel ??
-            (trustRequestSelectors ? normalizedSpawned.groupChannel : undefined);
-          resolvedGroupSpace =
-            trustedGroup.groupSpace ??
-            (trustRequestSelectors ? normalizedSpawned.groupSpace : undefined);
-        }
-        const deliveryFields = normalizeSessionDeliveryFields(entry);
-        // When the session has no delivery context yet (e.g. a freshly-spawned subagent
-        // with deliver: false), seed it from the request's channel/to/threadId params.
-        // Without this, subagent sessions end up with a channel-only deliveryContext
-        // and no `to`/`threadId`, which causes announce delivery to either target the
-        // wrong channel (when the parent's lastTo drifts) or fail entirely.
-        const requestDeliveryHint = normalizeDeliveryContext({
-          channel: request.channel?.trim(),
-          to: request.to?.trim(),
-          accountId: request.accountId?.trim(),
-          // Pass threadId directly — normalizeDeliveryContext handles both
-          // string and numeric threadIds (e.g., Matrix uses integers).
-          threadId: request.threadId,
-        });
-        const effectiveDelivery = mergeDeliveryContext(
-          deliveryFields.deliveryContext,
-          requestDeliveryHint,
-        );
-        const effectiveDeliveryFields = normalizeSessionDeliveryFields({
-          route: deliveryFields.route,
-          deliveryContext: effectiveDelivery,
-        });
-        const nextEntryPatch: SessionEntry = {
-          sessionId,
-          updatedAt: now,
-          sessionStartedAt: isNewSession
-            ? now
-            : (entry?.sessionStartedAt ??
-              resolveSessionLifecycleTimestamps({
-                entry,
-                storePath,
-                agentId: resolveAgentIdFromSessionKey(canonicalKey),
-              }).sessionStartedAt),
-          lastInteractionAt: touchInteraction ? now : entry?.lastInteractionAt,
-          thinkingLevel: entry?.thinkingLevel,
-          fastMode: entry?.fastMode,
-          verboseLevel: entry?.verboseLevel,
-          traceLevel: entry?.traceLevel,
-          reasoningLevel: entry?.reasoningLevel,
-          systemSent: entry?.systemSent,
-          sendPolicy: entry?.sendPolicy,
-          skillsSnapshot: entry?.skillsSnapshot,
-          route: effectiveDeliveryFields.route,
-          deliveryContext: effectiveDeliveryFields.deliveryContext,
-          lastChannel: effectiveDeliveryFields.lastChannel ?? entry?.lastChannel,
-          lastTo: effectiveDeliveryFields.lastTo ?? entry?.lastTo,
-          lastAccountId: effectiveDeliveryFields.lastAccountId ?? entry?.lastAccountId,
-          lastThreadId: effectiveDeliveryFields.lastThreadId ?? entry?.lastThreadId,
-          modelOverride: entry?.modelOverride,
-          providerOverride: entry?.providerOverride,
-          label: labelValue,
-          spawnedBy: spawnedByValue,
-          spawnedWorkspaceDir: entry?.spawnedWorkspaceDir,
-          spawnDepth: entry?.spawnDepth,
-          channel: entry?.channel ?? request.channel?.trim(),
-          groupId: resolvedGroupId,
-          groupChannel: resolvedGroupChannel,
-          space: resolvedGroupSpace,
-          ...(pluginOwnerId ? { pluginOwnerId } : {}),
-          ...(rotatedSessionId
-            ? {
-                status: undefined,
-                startedAt: undefined,
-                endedAt: undefined,
-                runtimeMs: undefined,
-                abortedLastRun: undefined,
-                sessionFile: undefined,
-              }
-            : { sessionFile: entry?.sessionFile }),
-          cliSessionIds: entry?.cliSessionIds,
-          cliSessionBindings: entry?.cliSessionBindings,
-          claudeCliSessionId: entry?.claudeCliSessionId,
-        };
-        sessionEntry = mergeSessionEntry(entry, nextEntryPatch);
-        if (request.deliver === true) {
-          const sendPolicy = resolveSendPolicy({
-            cfg,
-            entry: sessionEntry,
-            sessionKey: canonicalKey,
-            channel: sessionEntry?.channel,
-            chatType: sessionEntry?.chatType,
-          });
-          if (sendPolicy === "deny") {
-            respond(
-              false,
-              undefined,
-              errorShape(ErrorCodes.INVALID_REQUEST, "send blocked by session policy"),
-            );
-            return;
-          }
-        }
-        resolvedSessionId = sessionId;
-        const canonicalSessionKey = canonicalKey;
-        resolvedSessionKey = canonicalSessionKey;
-        const agentId = resolveAgentIdFromSessionKey(canonicalSessionKey);
-        const mainSessionKey = resolveAgentMainSessionKey({ cfg, agentId });
-        if (storePath) {
-          const requestedStoreKey = requestedSessionKey;
-          const persisted = await updateSessionStore(storePath, (store) => {
-            const { primaryKey } = migrateAndPruneGatewaySessionStoreKey({
-              cfg,
-              key: requestedStoreKey,
-              store,
-            });
-            const merged = mergeSessionEntry(store[primaryKey], nextEntryPatch);
-            store[primaryKey] = merged;
-            return merged;
-          });
-          sessionEntry = persisted;
-        }
-        if (canonicalSessionKey === mainSessionKey || canonicalSessionKey === "global") {
-          context.addChatRun(idem, {
-            sessionKey: canonicalSessionKey,
-            clientRunId: idem,
-          });
-          if (requestedBestEffortDeliver === undefined) {
-            bestEffortDeliver = true;
-          }
-        }
-        registerAgentRunContext(idem, { sessionKey: canonicalSessionKey });
+        // Keep bare /new and /reset behavior aligned with chat.send:
+        // reset first, then run a fresh-session greeting prompt in-place.
+        // Date is embedded in the prompt so agents read the correct daily
+        // memory files; skip further timestamp injection to avoid duplication.
+        message = bareResetPromptState.prompt;
+        skipTimestampInjection = true;
+        shouldPrependStartupContext =
+          bareResetPromptState.shouldPrependStartupContext &&
+          shouldApplyStartupContext({ cfg, action: resetReason });
       }
+    }
 
-      const connId = typeof client?.connId === "string" ? client.connId : undefined;
-      const wantsToolEvents = hasGatewayClientCap(
-        client?.connect?.caps,
-        GATEWAY_CLIENT_CAPS.TOOL_EVENTS,
-      );
-      if (connId && wantsToolEvents) {
-        context.registerToolEventRecipient(runId, connId);
-        // Register for any other active runs *in the same session* so
-        // late-joining clients (e.g. page refresh mid-response) receive
-        // in-progress tool events without leaking cross-session data.
-        for (const [activeRunId, active] of context.chatAbortControllers) {
-          if (activeRunId !== runId && active.sessionKey === requestedSessionKey) {
-            context.registerToolEventRecipient(activeRunId, connId);
-          }
-        }
-      }
+    // Inject timestamp into user-authored messages that don't already have one.
+    // Channel messages (Discord, Telegram, etc.) get timestamps via envelope
+    // formatting in a separate code path — they never reach this handler.
+    // See: https://github.com/openclaw/openclaw/issues/3658
+    if (!skipTimestampInjection && !isRawModelRun && inputProvenance?.kind !== "inter_session") {
+      message = injectTimestamp(message, timestampOptsFromConfig(cfg));
+    }
 
-      const wantsDelivery = request.deliver === true;
-      const explicitTo =
-        normalizeOptionalString(request.replyTo) ?? normalizeOptionalString(request.to);
-      const explicitThreadId = normalizeOptionalString(request.threadId);
-      const turnSourceChannel = normalizeOptionalString(request.channel);
-      const turnSourceTo = normalizeOptionalString(request.to);
-      const turnSourceAccountId = normalizeOptionalString(request.accountId);
-      const deliveryPlan = resolveAgentDeliveryPlan({
-        sessionEntry,
-        requestedChannel: request.replyChannel ?? request.channel,
-        explicitTo,
-        explicitThreadId,
-        accountId: request.replyAccountId ?? request.accountId,
-        wantsDelivery,
-        turnSourceChannel,
-        turnSourceTo,
-        turnSourceAccountId,
-        turnSourceThreadId: explicitThreadId,
+    if (requestedSessionKey) {
+      const {
+        cfg,
+        entry,
+        canonicalKey,
+        agentId: sessionAgentId,
+      } = loadSessionEntry(requestedSessionKey);
+      cfgForAgent = cfg;
+      const now = Date.now();
+      const routingInfo = readSqliteSessionRoutingInfo({
+        agentId: sessionAgentId,
+        sessionKey: canonicalKey,
       });
-
-      let resolvedChannel = deliveryPlan.resolvedChannel;
-      let deliveryTargetMode = deliveryPlan.deliveryTargetMode;
-      let resolvedAccountId = deliveryPlan.resolvedAccountId;
-      let resolvedTo = deliveryPlan.resolvedTo;
-      let effectivePlan = deliveryPlan;
-      let deliveryDowngradeReason: string | null = null;
-      let deliveryTargetResolutionError: Error | undefined;
-
-      if (wantsDelivery && resolvedChannel === INTERNAL_MESSAGE_CHANNEL) {
-        const cfgResolved = cfgForAgent ?? cfg;
+      const resetPolicy = resolveSessionResetPolicy({
+        sessionCfg: cfg.session,
+        resetType: resolveSessionResetType({
+          sessionKey: canonicalKey,
+          sessionScope: routingInfo?.sessionScope,
+          chatType: routingInfo?.chatType,
+        }),
+        resetOverride: resolveChannelResetConfig({
+          sessionCfg: cfg.session,
+          channel: routingInfo?.channel ?? entry?.channel ?? request.channel,
+        }),
+      });
+      const freshness = entry
+        ? evaluateSessionFreshness({
+            updatedAt: entry.updatedAt,
+            ...resolveSessionLifecycleTimestamps({
+              entry,
+              agentId: resolveAgentIdFromSessionKey(canonicalKey),
+            }),
+            now,
+            policy: resetPolicy,
+          })
+        : undefined;
+      const canReuseSession = Boolean(entry?.sessionId) && (freshness?.fresh ?? false);
+      const usableRequestedSessionId =
+        requestedSessionId && (!entry?.sessionId || canReuseSession)
+          ? requestedSessionId
+          : undefined;
+      const sessionId = usableRequestedSessionId
+        ? usableRequestedSessionId
+        : ((canReuseSession ? entry?.sessionId : undefined) ?? randomUUID());
+      isNewSession =
+        !entry ||
+        (!canReuseSession && !usableRequestedSessionId) ||
+        Boolean(usableRequestedSessionId && entry?.sessionId !== usableRequestedSessionId);
+      const touchInteraction =
+        request.bootstrapContextRunKind !== "cron" &&
+        request.bootstrapContextRunKind !== "heartbeat" &&
+        !request.internalEvents?.length;
+      const labelValue = normalizeOptionalString(request.label) || entry?.label;
+      const pluginOwnerId =
+        entry === undefined
+          ? normalizeOptionalString(client?.internal?.pluginRuntimeOwnerId)
+          : normalizeOptionalString(entry.pluginOwnerId);
+      const sessionAgent = resolveAgentIdFromSessionKey(canonicalKey);
+      spawnedByValue = canonicalizeSpawnedByForAgent(cfg, sessionAgent, entry?.spawnedBy);
+      const storedGroup = normalizeTrustedGroupMetadata(entry);
+      let inheritedGroup: TrustedGroupMetadata | undefined;
+      if (
+        spawnedByValue &&
+        (!storedGroup.groupId || !storedGroup.groupChannel || !storedGroup.groupSpace)
+      ) {
         try {
-          const selection = await resolveMessageChannelSelection({ cfg: cfgResolved });
-          resolvedChannel = selection.channel;
-          deliveryTargetMode = deliveryTargetMode ?? "implicit";
-          effectivePlan = {
-            ...deliveryPlan,
-            resolvedChannel,
-            deliveryTargetMode,
-            resolvedAccountId,
-          };
-        } catch (err) {
-          const shouldDowngrade = shouldDowngradeDeliveryToSessionOnly({
-            wantsDelivery,
-            bestEffortDeliver,
-            resolvedChannel,
+          const parentEntry = loadSessionEntry(spawnedByValue)?.entry;
+          const parentGroupKey = parseGroupKey(spawnedByValue);
+          inheritedGroup = normalizeTrustedGroupMetadata({
+            groupId: parentEntry?.groupId,
+            groupChannel: parentEntry?.groupChannel,
+            groupSpace: parentEntry?.space,
           });
-          if (!shouldDowngrade) {
-            respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
-            return;
-          }
-          deliveryDowngradeReason = String(err);
+          inheritedGroup = normalizeTrustedGroupMetadata({
+            groupId: inheritedGroup.groupId ?? parentGroupKey?.id,
+            groupChannel: inheritedGroup.groupChannel,
+            groupSpace: inheritedGroup.groupSpace,
+          });
+        } catch {
+          inheritedGroup = undefined;
         }
       }
-
-      if (!resolvedTo && isDeliverableMessageChannel(resolvedChannel)) {
-        const cfgResolved = cfgForAgent ?? cfg;
-        const fallback = resolveAgentOutboundTarget({
-          cfg: cfgResolved,
-          plan: effectivePlan,
-          targetMode: deliveryTargetMode ?? "implicit",
-          validateExplicitTarget: false,
+      const trustedGroup = resolveTrustedGroupMetadata({
+        stored: storedGroup,
+        inherited: inheritedGroup,
+        typedGroupId:
+          routingInfo?.chatType === "group" || routingInfo?.chatType === "channel"
+            ? routingInfo.conversationPeerId
+            : parseGroupKey(canonicalKey)?.id,
+      });
+      const trustRequestSelectors =
+        Boolean(trustedGroup.groupId) &&
+        requestGroupMatchesTrusted({
+          requestGroupId: normalizedSpawned.groupId,
+          trustedGroupId: trustedGroup.groupId,
         });
-        if (fallback.resolvedTarget?.ok) {
-          resolvedTo = fallback.resolvedTo;
-        } else if (fallback.resolvedTarget && !fallback.resolvedTarget.ok) {
-          deliveryTargetResolutionError = fallback.resolvedTarget.error;
-        }
+      if (!trustedGroup.groupId || !trustRequestSelectors) {
+        resolvedGroupId = undefined;
+        resolvedGroupChannel = undefined;
+        resolvedGroupSpace = undefined;
+      } else {
+        resolvedGroupId =
+          storedGroup.groupId ??
+          inheritedGroup?.groupId ??
+          normalizedSpawned.groupId ??
+          trustedGroup.groupId;
+        resolvedGroupChannel =
+          trustedGroup.groupChannel ??
+          (trustRequestSelectors ? normalizedSpawned.groupChannel : undefined);
+        resolvedGroupSpace =
+          trustedGroup.groupSpace ??
+          (trustRequestSelectors ? normalizedSpawned.groupSpace : undefined);
       }
-
-      if (wantsDelivery && isDeliverableMessageChannel(resolvedChannel) && !resolvedTo) {
-        if (!bestEffortDeliver) {
+      const deliveryFields = normalizeSessionDeliveryFields({
+        deliveryContext: entry?.deliveryContext,
+      });
+      // When the session has no delivery context yet (e.g. a freshly-spawned subagent
+      // with deliver: false), seed it from the request's channel/to/threadId params.
+      // Without this, subagent sessions end up with a channel-only deliveryContext
+      // and no `to`/`threadId`, which causes announce delivery to either target the
+      // wrong inherited route or fail entirely.
+      const requestDeliveryHint = normalizeDeliveryContext({
+        channel: request.channel?.trim(),
+        to: request.to?.trim(),
+        accountId: request.accountId?.trim(),
+        // Pass threadId directly — normalizeDeliveryContext handles both
+        // string and numeric threadIds (e.g., Matrix uses integers).
+        threadId: request.threadId,
+      });
+      const effectiveDelivery = mergeDeliveryContext(
+        deliveryFields.deliveryContext,
+        requestDeliveryHint,
+      );
+      const effectiveDeliveryFields = normalizeSessionDeliveryFields({
+        deliveryContext: effectiveDelivery,
+      });
+      const nextEntryPatch: SessionEntry = {
+        sessionId,
+        updatedAt: now,
+        sessionStartedAt: isNewSession
+          ? now
+          : (entry?.sessionStartedAt ??
+            resolveSessionLifecycleTimestamps({
+              entry,
+              agentId: resolveAgentIdFromSessionKey(canonicalKey),
+            }).sessionStartedAt),
+        lastInteractionAt: touchInteraction ? now : entry?.lastInteractionAt,
+        thinkingLevel: entry?.thinkingLevel,
+        fastMode: entry?.fastMode,
+        verboseLevel: entry?.verboseLevel,
+        traceLevel: entry?.traceLevel,
+        reasoningLevel: entry?.reasoningLevel,
+        systemSent: entry?.systemSent,
+        sendPolicy: entry?.sendPolicy,
+        skillsSnapshot: entry?.skillsSnapshot,
+        deliveryContext: effectiveDeliveryFields.deliveryContext,
+        modelOverride: entry?.modelOverride,
+        providerOverride: entry?.providerOverride,
+        label: labelValue,
+        spawnedBy: spawnedByValue,
+        spawnedWorkspaceDir: entry?.spawnedWorkspaceDir,
+        spawnDepth: entry?.spawnDepth,
+        channel:
+          effectiveDeliveryFields.deliveryContext?.channel ??
+          entry?.channel ??
+          request.channel?.trim(),
+        groupId: resolvedGroupId,
+        groupChannel: resolvedGroupChannel,
+        space: resolvedGroupSpace,
+        ...(pluginOwnerId ? { pluginOwnerId } : {}),
+        cliSessionBindings: entry?.cliSessionBindings,
+      };
+      sessionEntry = mergeSessionEntry(entry, nextEntryPatch);
+      if (request.deliver === true) {
+        const sendPolicy = resolveSendPolicy({
+          cfg,
+          entry: sessionEntry,
+          sessionKey: canonicalKey,
+          channel: sessionEntry?.channel,
+          chatType: sessionEntry?.chatType,
+        });
+        if (sendPolicy === "deny") {
           respond(
             false,
             undefined,
-            errorShape(
-              ErrorCodes.INVALID_REQUEST,
-              deliveryTargetResolutionError
-                ? String(deliveryTargetResolutionError)
-                : `delivery target is required for ${resolvedChannel}: pass --to/--reply-to or configure a default target`,
-            ),
+            errorShape(ErrorCodes.INVALID_REQUEST, "send blocked by session policy"),
           );
           return;
         }
-        context.logGateway.info(
-          deliveryTargetResolutionError
-            ? `agent delivery target missing (bestEffortDeliver): ${String(deliveryTargetResolutionError)}`
-            : "agent delivery target missing (bestEffortDeliver): no deliverable target",
-        );
       }
+      resolvedSessionId = sessionId;
+      const canonicalSessionKey = canonicalKey;
+      resolvedSessionKey = canonicalSessionKey;
+      const agentId = resolveAgentIdFromSessionKey(canonicalSessionKey);
+      const mainSessionKey = resolveAgentMainSessionKey({ cfg, agentId });
+      const persisted = mergeSessionEntry(entry, nextEntryPatch);
+      upsertSessionEntry({
+        agentId: sessionAgentId,
+        sessionKey: canonicalSessionKey,
+        entry: persisted,
+      });
+      sessionEntry = persisted;
+      if (canonicalSessionKey === mainSessionKey || canonicalSessionKey === "global") {
+        context.addChatRun(idem, {
+          sessionKey: canonicalSessionKey,
+          clientRunId: idem,
+        });
+        if (requestedBestEffortDeliver === undefined) {
+          bestEffortDeliver = true;
+        }
+      }
+      registerAgentRunContext(idem, { sessionKey: canonicalSessionKey });
+    }
 
-      if (wantsDelivery && resolvedChannel === INTERNAL_MESSAGE_CHANNEL) {
+    const connId = typeof client?.connId === "string" ? client.connId : undefined;
+    const wantsToolEvents = hasGatewayClientCap(
+      client?.connect?.caps,
+      GATEWAY_CLIENT_CAPS.TOOL_EVENTS,
+    );
+    if (connId && wantsToolEvents) {
+      context.registerToolEventRecipient(runId, connId);
+      // Register for any other active runs *in the same session* so
+      // late-joining clients (e.g. page refresh mid-response) receive
+      // in-progress tool events without leaking cross-session data.
+      for (const [activeRunId, active] of context.chatAbortControllers) {
+        if (activeRunId !== runId && active.sessionKey === requestedSessionKey) {
+          context.registerToolEventRecipient(activeRunId, connId);
+        }
+      }
+    }
+
+    const wantsDelivery = request.deliver === true;
+    const explicitTo =
+      normalizeOptionalString(request.replyTo) ?? normalizeOptionalString(request.to);
+    const explicitThreadId = normalizeOptionalString(request.threadId);
+    const turnSourceChannel = normalizeOptionalString(request.channel);
+    const turnSourceTo = normalizeOptionalString(request.to);
+    const turnSourceAccountId = normalizeOptionalString(request.accountId);
+    const deliveryPlan = resolveAgentDeliveryPlan({
+      sessionEntry,
+      requestedChannel: request.replyChannel ?? request.channel,
+      explicitTo,
+      explicitThreadId,
+      accountId: request.replyAccountId ?? request.accountId,
+      wantsDelivery,
+      turnSourceChannel,
+      turnSourceTo,
+      turnSourceAccountId,
+      turnSourceThreadId: explicitThreadId,
+    });
+
+    let resolvedChannel = deliveryPlan.resolvedChannel;
+    let deliveryTargetMode = deliveryPlan.deliveryTargetMode;
+    let resolvedAccountId = deliveryPlan.resolvedAccountId;
+    let resolvedTo = deliveryPlan.resolvedTo;
+    let effectivePlan = deliveryPlan;
+    let deliveryDowngradeReason: string | null = null;
+    let deliveryTargetResolutionError: Error | undefined;
+
+    if (wantsDelivery && resolvedChannel === INTERNAL_MESSAGE_CHANNEL) {
+      const cfgResolved = cfgForAgent ?? cfg;
+      try {
+        const selection = await resolveMessageChannelSelection({ cfg: cfgResolved });
+        resolvedChannel = selection.channel;
+        deliveryTargetMode = deliveryTargetMode ?? "implicit";
+        effectivePlan = {
+          ...deliveryPlan,
+          resolvedChannel,
+          deliveryTargetMode,
+          resolvedAccountId,
+        };
+      } catch (err) {
         const shouldDowngrade = shouldDowngradeDeliveryToSessionOnly({
           wantsDelivery,
           bestEffortDeliver,
           resolvedChannel,
         });
         if (!shouldDowngrade) {
-          respond(
-            false,
-            undefined,
-            errorShape(
-              ErrorCodes.INVALID_REQUEST,
-              "delivery channel is required: pass --channel/--reply-channel or use a main session with a previous channel",
-            ),
-          );
+          respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
           return;
         }
-        context.logGateway.info(
-          deliveryDowngradeReason
-            ? `agent delivery downgraded to session-only (bestEffortDeliver): ${deliveryDowngradeReason}`
-            : "agent delivery downgraded to session-only (bestEffortDeliver): no deliverable channel",
-        );
+        deliveryDowngradeReason = String(err);
       }
+    }
 
-      const normalizedTurnSource = normalizeMessageChannel(turnSourceChannel);
-      const turnSourceMessageChannel =
-        normalizedTurnSource && isKnownGatewayChannel(normalizedTurnSource)
-          ? normalizedTurnSource
-          : undefined;
-      const originMessageChannel =
-        turnSourceMessageChannel ??
-        (client?.connect && isWebchatConnect(client.connect)
-          ? INTERNAL_MESSAGE_CHANNEL
-          : resolvedChannel);
+    if (!resolvedTo && isDeliverableMessageChannel(resolvedChannel)) {
+      const cfgResolved = cfgForAgent ?? cfg;
+      const fallback = resolveAgentOutboundTarget({
+        cfg: cfgResolved,
+        plan: effectivePlan,
+        targetMode: deliveryTargetMode ?? "implicit",
+        validateExplicitTarget: false,
+      });
+      if (fallback.resolvedTarget?.ok) {
+        resolvedTo = fallback.resolvedTo;
+      } else if (fallback.resolvedTarget && !fallback.resolvedTarget.ok) {
+        deliveryTargetResolutionError = fallback.resolvedTarget.error;
+      }
+    }
 
-      const deliver = request.deliver === true && resolvedChannel !== INTERNAL_MESSAGE_CHANNEL;
-
-      // Register before the accepted ack so an immediate chat.abort/sessions.abort
-      // cannot race the active-run entry. Agent RPC runs use the agent timeout;
-      // chat.send keeps the shorter chat cleanup cap.
-      const now = Date.now();
-      const timeoutMs = resolveAgentTimeoutMs({
-        cfg: cfgForAgent ?? cfg,
-        overrideSeconds: typeof request.timeout === "number" ? request.timeout : undefined,
-      });
-      const activeModelProvider =
-        providerOverride ??
-        resolveSessionModelRef(
-          cfgForAgent ?? cfg,
-          sessionEntry,
-          resolvedSessionKey
-            ? resolveAgentIdFromSessionKey(resolvedSessionKey)
-            : (agentId ?? resolveDefaultAgentId(cfgForAgent ?? cfg)),
-        ).provider;
-      const activeAuthProvider = resolveProviderIdForAuth(activeModelProvider, {
-        config: cfgForAgent ?? cfg,
-      });
-      const activeRunAbort = registerChatAbortController({
-        chatAbortControllers: context.chatAbortControllers,
-        runId,
-        sessionId: resolvedSessionId ?? runId,
-        sessionKey: resolvedSessionKey,
-        timeoutMs,
-        now,
-        expiresAtMs: resolveAgentRunExpiresAtMs({ now, timeoutMs }),
-        ownerConnId: typeof client?.connId === "string" ? client.connId : undefined,
-        ownerDeviceId:
-          typeof client?.connect?.device?.id === "string" ? client.connect.device.id : undefined,
-        providerId: activeModelProvider,
-        authProviderId: activeAuthProvider,
-        kind: "agent",
-      });
-      if (!activeRunAbort.registered && context.chatAbortControllers.has(runId)) {
-        agentRunAccepted = true;
-        respond(true, { runId, status: "in_flight" as const }, undefined, {
-          cached: true,
-          runId,
-        });
+    if (wantsDelivery && isDeliverableMessageChannel(resolvedChannel) && !resolvedTo) {
+      if (!bestEffortDeliver) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            deliveryTargetResolutionError
+              ? String(deliveryTargetResolutionError)
+              : `delivery target is required for ${resolvedChannel}: pass --to/--reply-to or configure a default target`,
+          ),
+        );
         return;
       }
+      context.logGateway.info(
+        deliveryTargetResolutionError
+          ? `agent delivery target missing (bestEffortDeliver): ${String(deliveryTargetResolutionError)}`
+          : "agent delivery target missing (bestEffortDeliver): no deliverable target",
+      );
+    }
 
-      const accepted = {
-        runId,
-        status: "accepted" as const,
-        acceptedAt: Date.now(),
-      };
-      agentRunAccepted = true;
-      // Store an in-flight ack so retries do not spawn a second run.
-      setGatewayDedupeEntries({
-        dedupe: context.dedupe,
-        keys: agentDedupeKeys,
-        entry: {
-          ts: Date.now(),
-          ok: true,
-          payload: accepted,
-        },
+    if (wantsDelivery && resolvedChannel === INTERNAL_MESSAGE_CHANNEL) {
+      const shouldDowngrade = shouldDowngradeDeliveryToSessionOnly({
+        wantsDelivery,
+        bestEffortDeliver,
+        resolvedChannel,
       });
-      respond(true, accepted, undefined, { runId });
-      // Give the accepted frame one event-loop turn to flush before the runner
-      // starts potentially heavy synchronous prompt/context setup. The dispatch
-      // is scheduled out of this request handler so immediate agent.wait calls
-      // can reach the gateway before the pre-turn runner monopolizes the loop.
-      void (async () => {
-        await yieldAfterAgentAcceptedAck();
+      if (!shouldDowngrade) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "delivery channel is required: pass --channel/--reply-channel or use a main session with a previous channel",
+          ),
+        );
+        return;
+      }
+      context.logGateway.info(
+        deliveryDowngradeReason
+          ? `agent delivery downgraded to session-only (bestEffortDeliver): ${deliveryDowngradeReason}`
+          : "agent delivery downgraded to session-only (bestEffortDeliver): no deliverable channel",
+      );
+    }
 
-        let dispatched = false;
-        try {
-          if (resolvedSessionKey) {
-            await reactivateCompletedSubagentSession({
-              sessionKey: resolvedSessionKey,
-              runId,
-            });
-          }
+    const normalizedTurnSource = normalizeMessageChannel(turnSourceChannel);
+    const turnSourceMessageChannel =
+      normalizedTurnSource && isKnownGatewayChannel(normalizedTurnSource)
+        ? normalizedTurnSource
+        : undefined;
+    const originMessageChannel =
+      turnSourceMessageChannel ??
+      (client?.connect && isWebchatConnect(client.connect)
+        ? INTERNAL_MESSAGE_CHANNEL
+        : resolvedChannel);
 
-          if (requestedSessionKey && resolvedSessionKey && isNewSession) {
-            emitSessionsChanged(context, {
-              sessionKey: resolvedSessionKey,
-              reason: "create",
-            });
-          }
-          if (resolvedSessionKey) {
-            emitSessionsChanged(context, {
-              sessionKey: resolvedSessionKey,
-              reason: "send",
-            });
-          }
+    const deliver = request.deliver === true && resolvedChannel !== INTERNAL_MESSAGE_CHANNEL;
 
-          if (shouldPrependStartupContext && resolvedSessionKey) {
-            const startupCfg = cfgForAgent ?? cfg;
-            if (
-              !shouldSkipStartupContextForSpawnedSandbox({
-                cfg: startupCfg,
-                sessionKey: resolvedSessionKey,
-                spawnedBy: spawnedByValue,
-              })
-            ) {
-              const { runtimeWorkspaceDir } = resolveSessionRuntimeWorkspace({
-                cfg: startupCfg,
-                sessionKey: resolvedSessionKey,
-                sessionEntry,
-                spawnedBy: spawnedByValue,
-              });
-              const startupContextPrelude = await buildSessionStartupContextPrelude({
-                workspaceDir: runtimeWorkspaceDir,
-                cfg: startupCfg,
-              });
-              if (startupContextPrelude) {
-                message = `${startupContextPrelude}\n\n${message}`;
-              }
+    // Register before the accepted ack so an immediate chat.abort/sessions.abort
+    // cannot race the active-run entry. Agent RPC runs use the agent timeout;
+    // chat.send keeps the shorter chat cleanup cap.
+    const now = Date.now();
+    const timeoutMs = resolveAgentTimeoutMs({
+      cfg: cfgForAgent ?? cfg,
+      overrideSeconds: typeof request.timeout === "number" ? request.timeout : undefined,
+    });
+    const activeModelProvider =
+      providerOverride ??
+      resolveSessionModelRef(
+        cfgForAgent ?? cfg,
+        sessionEntry,
+        resolvedSessionKey
+          ? resolveAgentIdFromSessionKey(resolvedSessionKey)
+          : (agentId ?? resolveDefaultAgentId(cfgForAgent ?? cfg)),
+      ).provider;
+    const activeAuthProvider = resolveProviderIdForAuth(activeModelProvider, {
+      config: cfgForAgent ?? cfg,
+    });
+    const activeRunAbort = registerChatAbortController({
+      chatAbortControllers: context.chatAbortControllers,
+      runId,
+      sessionId: resolvedSessionId ?? runId,
+      sessionKey: resolvedSessionKey,
+      timeoutMs,
+      now,
+      expiresAtMs: resolveAgentRunExpiresAtMs({ now, timeoutMs }),
+      ownerConnId: typeof client?.connId === "string" ? client.connId : undefined,
+      ownerDeviceId:
+        typeof client?.connect?.device?.id === "string" ? client.connect.device.id : undefined,
+      providerId: activeModelProvider,
+      authProviderId: activeAuthProvider,
+      kind: "agent",
+    });
+    if (!activeRunAbort.registered && context.chatAbortControllers.has(runId)) {
+      agentRunAccepted = true;
+      respond(true, { runId, status: "in_flight" as const }, undefined, {
+        cached: true,
+        runId,
+      });
+      return;
+    }
+
+    const accepted = {
+      runId,
+      status: "accepted" as const,
+      acceptedAt: Date.now(),
+    };
+    agentRunAccepted = true;
+    // Store an in-flight ack so retries do not spawn a second run.
+    setGatewayDedupeEntries({
+      dedupe: context.dedupe,
+      keys: agentDedupeKeys,
+      entry: {
+        ts: Date.now(),
+        ok: true,
+        payload: accepted,
+      },
+    });
+    respond(true, accepted, undefined, { runId });
+    // Give the accepted frame one event-loop turn to flush before the runner
+    // starts potentially heavy synchronous prompt/context setup. The dispatch
+    // is scheduled out of this request handler so immediate agent.wait calls
+    // can reach the gateway before the pre-turn runner monopolizes the loop.
+    void (async () => {
+      await yieldAfterAgentAcceptedAck();
+
+      let dispatched = false;
+      try {
+        if (resolvedSessionKey) {
+          await reactivateCompletedSubagentSession({
+            sessionKey: resolvedSessionKey,
+            runId,
+          });
+        }
+
+        if (requestedSessionKey && resolvedSessionKey && isNewSession) {
+          emitSessionsChanged(context, {
+            sessionKey: resolvedSessionKey,
+            reason: "create",
+          });
+        }
+        if (resolvedSessionKey) {
+          emitSessionsChanged(context, {
+            sessionKey: resolvedSessionKey,
+            reason: "send",
+          });
+        }
+
+        if (shouldPrependStartupContext && resolvedSessionKey) {
+          const startupCfg = cfgForAgent ?? cfg;
+          if (
+            !shouldSkipStartupContextForSpawnedSandbox({
+              cfg: startupCfg,
+              sessionKey: resolvedSessionKey,
+              spawnedBy: spawnedByValue,
+            })
+          ) {
+            const { runtimeWorkspaceDir } = resolveSessionRuntimeWorkspace({
+              cfg: startupCfg,
+              sessionKey: resolvedSessionKey,
+              sessionEntry,
+              spawnedBy: spawnedByValue,
+            });
+            const startupContextPrelude = await buildSessionStartupContextPrelude({
+              workspaceDir: runtimeWorkspaceDir,
+              cfg: startupCfg,
+            });
+            if (startupContextPrelude) {
+              message = `${startupContextPrelude}\n\n${message}`;
             }
           }
-          if (!isRawModelRun) {
-            message = annotateInterSessionPromptText(message, inputProvenance);
-          }
+        }
+        if (!isRawModelRun) {
+          message = annotateInterSessionPromptText(message, inputProvenance);
+        }
 
-          const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
-          const ingressAgentId =
-            agentId &&
-            (!resolvedSessionKey || resolveAgentIdFromSessionKey(resolvedSessionKey) === agentId)
-              ? agentId
-              : undefined;
-          let execApprovalFollowupRuntimeHandoff =
-            canUseInternalRuntimeHandoff && execApprovalFollowupApprovalId
-              ? consumeExecApprovalFollowupRuntimeHandoff({
-                  handoffId: request.internalRuntimeHandoffId,
-                  approvalId: execApprovalFollowupApprovalId,
-                  idempotencyKey: idem,
-                  sessionKey: resolvedSessionKey,
-                })
-              : undefined;
-          if (
-            !execApprovalFollowupRuntimeHandoff &&
-            canUseInternalRuntimeHandoff &&
-            execApprovalFollowupApprovalId &&
-            requestedSessionKeyRaw &&
-            requestedSessionKeyRaw !== resolvedSessionKey
-          ) {
-            execApprovalFollowupRuntimeHandoff = consumeExecApprovalFollowupRuntimeHandoff({
-              handoffId: request.internalRuntimeHandoffId,
-              approvalId: execApprovalFollowupApprovalId,
-              idempotencyKey: idem,
-              sessionKey: requestedSessionKeyRaw,
-            });
-          }
-          const execApprovalFollowupElevatedDefaults =
-            execApprovalFollowupRuntimeHandoff?.bashElevated;
+        const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
+        const ingressAgentId =
+          agentId &&
+          (!resolvedSessionKey || resolveAgentIdFromSessionKey(resolvedSessionKey) === agentId)
+            ? agentId
+            : undefined;
+        let execApprovalFollowupRuntimeHandoff =
+          canUseInternalRuntimeHandoff && execApprovalFollowupApprovalId
+            ? consumeExecApprovalFollowupRuntimeHandoff({
+                handoffId: request.internalRuntimeHandoffId,
+                approvalId: execApprovalFollowupApprovalId,
+                idempotencyKey: idem,
+                sessionKey: resolvedSessionKey,
+              })
+            : undefined;
+        if (
+          !execApprovalFollowupRuntimeHandoff &&
+          canUseInternalRuntimeHandoff &&
+          execApprovalFollowupApprovalId &&
+          requestedSessionKeyRaw &&
+          requestedSessionKeyRaw !== resolvedSessionKey
+        ) {
+          execApprovalFollowupRuntimeHandoff = consumeExecApprovalFollowupRuntimeHandoff({
+            handoffId: request.internalRuntimeHandoffId,
+            approvalId: execApprovalFollowupApprovalId,
+            idempotencyKey: idem,
+            sessionKey: requestedSessionKeyRaw,
+          });
+        }
+        const execApprovalFollowupElevatedDefaults =
+          execApprovalFollowupRuntimeHandoff?.bashElevated;
 
-          dispatchAgentRunFromGateway({
-            ingressOpts: {
-              message,
-              images,
-              imageOrder,
-              agentId: ingressAgentId,
-              provider: providerOverride,
-              model: modelOverride,
-              to: resolvedTo,
-              sessionId: resolvedSessionId,
-              sessionKey: resolvedSessionKey,
-              thinking: request.thinking,
-              deliver,
-              deliveryTargetMode,
-              channel: resolvedChannel,
+        dispatchAgentRunFromGateway({
+          ingressOpts: {
+            message,
+            images,
+            imageOrder,
+            agentId: ingressAgentId,
+            provider: providerOverride,
+            model: modelOverride,
+            to: resolvedTo,
+            sessionId: resolvedSessionId,
+            sessionKey: resolvedSessionKey,
+            thinking: request.thinking,
+            deliver,
+            deliveryTargetMode,
+            channel: resolvedChannel,
+            accountId: resolvedAccountId,
+            threadId: resolvedThreadId,
+            runContext: {
+              messageChannel: originMessageChannel,
               accountId: resolvedAccountId,
-              threadId: resolvedThreadId,
-              runContext: {
-                messageChannel: originMessageChannel,
-                accountId: resolvedAccountId,
-                groupId: resolvedGroupId,
-                groupChannel: resolvedGroupChannel,
-                groupSpace: resolvedGroupSpace,
-                currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
-              },
-              ...(execApprovalFollowupElevatedDefaults
-                ? { bashElevated: execApprovalFollowupElevatedDefaults }
-                : {}),
               groupId: resolvedGroupId,
               groupChannel: resolvedGroupChannel,
               groupSpace: resolvedGroupSpace,
-              spawnedBy: spawnedByValue,
-              timeout: request.timeout?.toString(),
-              bestEffortDeliver,
-              messageChannel: originMessageChannel,
-              runId,
-              lane: request.lane,
-              modelRun: request.modelRun === true,
-              promptMode: request.promptMode,
-              extraSystemPrompt: request.extraSystemPrompt,
-              bootstrapContextMode: request.bootstrapContextMode,
-              bootstrapContextRunKind: request.bootstrapContextRunKind,
-              acpTurnSource: request.acpTurnSource,
-              internalEvents: request.internalEvents,
+              currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
+            },
+            ...(execApprovalFollowupElevatedDefaults
+              ? { bashElevated: execApprovalFollowupElevatedDefaults }
+              : {}),
+            groupId: resolvedGroupId,
+            groupChannel: resolvedGroupChannel,
+            groupSpace: resolvedGroupSpace,
+            spawnedBy: spawnedByValue,
+            timeout: request.timeout?.toString(),
+            bestEffortDeliver,
+            messageChannel: originMessageChannel,
+            runId,
+            lane: request.lane,
+            modelRun: request.modelRun === true,
+            promptMode: request.promptMode,
+            extraSystemPrompt: request.extraSystemPrompt,
+            bootstrapContextMode: request.bootstrapContextMode,
+            bootstrapContextRunKind: request.bootstrapContextRunKind,
+            acpTurnSource: request.acpTurnSource,
+            internalEvents: request.internalEvents,
+            inputProvenance,
+            sourceReplyDeliveryMode: request.sourceReplyDeliveryMode,
+            suppressPromptPersistence: shouldSuppressPromptPersistenceForAgentRun({
               inputProvenance,
-              sourceReplyDeliveryMode: request.sourceReplyDeliveryMode,
-              suppressPromptPersistence: shouldSuppressAgentPromptPersistence({
-                inputProvenance,
-                internalEvents: request.internalEvents,
-              }),
-              cleanupBundleMcpOnRunEnd: request.cleanupBundleMcpOnRunEnd,
-              abortSignal: activeRunAbort.controller.signal,
-              onActiveModelSelected: ({ provider }) => {
-                updateChatRunProvider(context.chatAbortControllers, {
-                  runId,
-                  providerId: provider,
-                  authProviderId: resolveProviderIdForAuth(provider, {
-                    config: cfgForAgent ?? cfg,
-                  }),
-                });
-              },
-              // Internal-only: allow workspace override for spawned subagent runs.
-              workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
-                spawnedBy: spawnedByValue,
-                workspaceDir: sessionEntry?.spawnedWorkspaceDir,
-              }),
-              allowModelOverride,
+              internalEvents: request.internalEvents,
+            }),
+            initialVfsEntries: request.initialVfsEntries,
+            cleanupBundleMcpOnRunEnd: request.cleanupBundleMcpOnRunEnd,
+            abortSignal: activeRunAbort.controller.signal,
+            onActiveModelSelected: ({ provider }) => {
+              updateChatRunProvider(context.chatAbortControllers, {
+                runId,
+                providerId: provider,
+                authProviderId: resolveProviderIdForAuth(provider, {
+                  config: cfgForAgent ?? cfg,
+                }),
+              });
             },
-            runId,
-            dedupeKeys: agentDedupeKeys,
-            abortController: activeRunAbort.controller,
-            respond,
-            context,
-          });
-          dispatched = true;
-        } catch (err) {
-          const error = errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err));
-          const payload = {
-            runId,
-            status: "error" as const,
-            summary: formatForLog(err),
-          };
-          setGatewayDedupeEntries({
-            dedupe: context.dedupe,
-            keys: agentDedupeKeys,
-            entry: {
-              ts: Date.now(),
-              ok: false,
-              payload,
-              error,
-            },
-          });
-          respond(false, payload, error, {
-            runId,
-            error: formatForLog(err),
-          });
-        } finally {
-          if (!dispatched) {
-            activeRunAbort.cleanup();
-          }
+            // Internal-only: allow workspace override for spawned subagent runs.
+            workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
+              spawnedBy: spawnedByValue,
+              workspaceDir: sessionEntry?.spawnedWorkspaceDir,
+            }),
+            senderIsOwner,
+            allowModelOverride,
+          },
+          runId,
+          idempotencyKey: idem,
+          dedupeKeys: agentDedupeKeys,
+          abortController: activeRunAbort.controller,
+          respond,
+          context,
+        });
+        dispatched = true;
+      } catch (err) {
+        const error = errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err));
+        const payload = {
+          runId,
+          status: "error" as const,
+          summary: formatForLog(err),
+        };
+        setGatewayDedupeEntries({
+          dedupe: context.dedupe,
+          keys: agentDedupeKeys,
+          entry: {
+            ts: Date.now(),
+            ok: false,
+            payload,
+            error,
+          },
+        });
+        respond(false, payload, error, {
+          runId,
+          error: formatForLog(err),
+        });
+      } finally {
+        if (!dispatched) {
+          activeRunAbort.cleanup();
         }
-      })();
+      }
+    })();
     } finally {
       clearUnacceptedExecApprovalFollowupDedupe();
     }

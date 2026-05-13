@@ -36,7 +36,8 @@ vi.mock("../../agents/auth-profiles.js", () => ({
   },
   resolveAuthProfileDisplayLabel: ({ profileId }: { profileId: string }) => profileId,
   resolveAuthProfileOrder: () => [],
-  resolveAuthStorePathForDisplay: () => "/tmp/auth-profiles.json",
+  resolveAuthProfileStoreLocationForDisplay: () =>
+    "/tmp/openclaw.sqlite#table/auth_profile_stores/main",
 }));
 
 vi.mock("../../agents/auth-profiles/store.js", () => {
@@ -163,7 +164,12 @@ vi.mock("../../agents/sandbox.js", () => ({
 }));
 
 vi.mock("../../config/sessions.js", () => ({
-  updateSessionStore: vi.fn(async () => {}),
+  getSessionEntry: vi.fn(() => undefined),
+  mergeSessionEntry: (existing: SessionEntry | undefined, patch: Partial<SessionEntry>) => ({
+    ...existing,
+    ...patch,
+  }),
+  upsertSessionEntry: vi.fn(async () => {}),
 }));
 
 vi.mock("../../infra/system-events.js", () => ({
@@ -341,7 +347,6 @@ async function persistModelDirectiveForTest(params: {
     sessionEntry,
     sessionStore: { "agent:main:dm:1": sessionEntry },
     sessionKey: "agent:main:dm:1",
-    storePath: undefined,
     elevatedEnabled: false,
     elevatedAllowed: false,
     defaultProvider: "anthropic",
@@ -373,7 +378,6 @@ async function persistInternalOperatorWriteDirective(
     sessionEntry,
     sessionStore,
     sessionKey: "agent:main:main",
-    storePath: "/tmp/sessions.json",
     elevatedEnabled: true,
     elevatedAllowed: true,
     defaultProvider: "anthropic",
@@ -1182,7 +1186,6 @@ describe("handleDirectiveOnly model persist behavior (fixes #1435)", () => {
     { provider: "openai", id: "gpt-4o", name: "GPT-4o" },
   ];
   const sessionKey = "agent:main:dm:1";
-  const storePath = "/tmp/sessions.json";
 
   type HandleParams = Parameters<typeof handleDirectiveOnly>[0];
 
@@ -1197,7 +1200,6 @@ describe("handleDirectiveOnly model persist behavior (fixes #1435)", () => {
       cfg: baseConfig(),
       directives: rest.directives ?? parseInlineDirectives(""),
       sessionKey,
-      storePath,
       elevatedEnabled: false,
       elevatedAllowed: false,
       defaultProvider: "anthropic",

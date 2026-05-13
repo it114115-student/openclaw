@@ -1,13 +1,8 @@
-import { createHash } from "node:crypto";
-import type {
-  AgentTool,
-  AgentToolResult,
-  AgentToolUpdateCallback,
-} from "@earendil-works/pi-agent-core";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { logDebug, logError } from "../logger.js";
 import { redactToolDetail } from "../logging/redact.js";
 import { isPlainObject } from "../utils.js";
+import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "./agent-core-contract.js";
+import type { ToolDefinition } from "./agent-extension-contract.js";
 import { sanitizeForConsole } from "./console-sanitize.js";
 import type { ClientToolDefinition } from "./pi-embedded-runner/run/params.js";
 import type { HookContext } from "./pi-tools.before-tool-call.js";
@@ -26,13 +21,13 @@ type ToolExecuteArgsCurrent = [
   string,
   unknown,
   AbortSignal | undefined,
-  AgentToolUpdateCallback<unknown> | undefined,
+  AgentToolUpdateCallback | undefined,
   unknown,
 ];
 type ToolExecuteArgsLegacy = [
   string,
   unknown,
-  AgentToolUpdateCallback<unknown> | undefined,
+  AgentToolUpdateCallback | undefined,
   unknown,
   AbortSignal | undefined,
 ];
@@ -41,9 +36,6 @@ type ToolExecuteArgs = ToolDefinition["execute"] extends (...args: infer P) => u
   : ToolExecuteArgsCurrent;
 type ToolExecuteArgsAny = ToolExecuteArgs | ToolExecuteArgsLegacy | ToolExecuteArgsCurrent;
 const TOOL_ERROR_PARAM_PREVIEW_MAX_CHARS = 600;
-const TOOL_ERROR_EXEC_COMMAND_HASH_CHARS = 16;
-const SENSITIVE_EXEC_ENV_VALUE = "[omitted exec env value]";
-const EXEC_COMMAND_PARAM_KEYS = new Set(["command", "cmd"]);
 
 export type ClientToolCallRecorder =
   | ((toolName: string, params: Record<string, unknown>) => void)
@@ -116,99 +108,15 @@ function formatToolParamPreview(label: string, value: unknown): string {
   return `${label}=${preview}`;
 }
 
-function kindForLog(value: unknown): string {
-  if (Array.isArray(value)) {
-    return "array";
-  }
-  if (value === null) {
-    return "null";
-  }
-  return typeof value;
-}
-
-function summarizeSensitiveValueForLog(params: {
-  value: unknown;
-  reason: string;
-}): Record<string, unknown> {
-  const serialized = serializeToolParams(params.value);
-  return {
-    omitted: true,
-    reason: params.reason,
-    type: kindForLog(params.value),
-    chars: serialized.length,
-    sha256: createHash("sha256")
-      .update(serialized)
-      .digest("hex")
-      .slice(0, TOOL_ERROR_EXEC_COMMAND_HASH_CHARS),
-  };
-}
-
-function summarizeExecCommandForLog(command: unknown): Record<string, unknown> {
-  return summarizeSensitiveValueForLog({
-    value: command,
-    reason: "exec command may contain credentials",
-  });
-}
-
-function sanitizeExecEnvForLog(value: unknown): unknown {
-  if (!isPlainObject(value)) {
-    return value === undefined ? undefined : "[omitted exec env]";
-  }
-  return Object.fromEntries(
-    Object.keys(value)
-      .toSorted()
-      .map((key) => [key, SENSITIVE_EXEC_ENV_VALUE]),
-  );
-}
-
-function sanitizeExecFailureParamsForLog(value: unknown): unknown {
-  if (typeof value === "string") {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      if (isPlainObject(parsed)) {
-        return sanitizeExecFailureParamsForLog(parsed);
-      }
-    } catch {
-      // Non-JSON exec params can still be a raw model-supplied command payload.
-    }
-  }
-  if (!isPlainObject(value)) {
-    return summarizeSensitiveValueForLog({
-      value,
-      reason: "exec params may contain command credentials",
-    });
-  }
-  const sanitized: Record<string, unknown> = {};
-  for (const [key, field] of Object.entries(value)) {
-    if (EXEC_COMMAND_PARAM_KEYS.has(key)) {
-      sanitized[key] = summarizeExecCommandForLog(field);
-      continue;
-    }
-    if (key === "env") {
-      sanitized[key] = sanitizeExecEnvForLog(field);
-      continue;
-    }
-    sanitized[key] = field;
-  }
-  return sanitized;
-}
-
-function sanitizeToolFailureParamsForLog(toolName: string, value: unknown): unknown {
-  return toolName === "exec" ? sanitizeExecFailureParamsForLog(value) : value;
-}
-
 function describeToolFailureInputs(params: {
-  toolName: string;
   rawParams: unknown;
   effectiveParams: unknown;
 }): string {
-  const rawParams = sanitizeToolFailureParamsForLog(params.toolName, params.rawParams);
-  const effectiveParams = sanitizeToolFailureParamsForLog(params.toolName, params.effectiveParams);
-  const parts = [formatToolParamPreview("raw_params", rawParams)];
-  const rawSerialized = serializeToolParams(rawParams);
-  const effectiveSerialized = serializeToolParams(effectiveParams);
+  const parts = [formatToolParamPreview("raw_params", params.rawParams)];
+  const rawSerialized = serializeToolParams(params.rawParams);
+  const effectiveSerialized = serializeToolParams(params.effectiveParams);
   if (effectiveSerialized !== rawSerialized) {
-    parts.push(formatToolParamPreview("effective_params", effectiveParams));
+    parts.push(formatToolParamPreview("effective_params", params.effectiveParams));
   }
   return parts.join(" ");
 }
@@ -216,12 +124,12 @@ function describeToolFailureInputs(params: {
 function normalizeToolExecutionResult(params: {
   toolName: string;
   result: unknown;
-}): AgentToolResult<unknown> {
+}): AgentToolResult {
   const { toolName, result } = params;
   if (result && typeof result === "object") {
     const record = result as Record<string, unknown>;
     if (Array.isArray(record.content)) {
-      return result as AgentToolResult<unknown>;
+      return result as AgentToolResult;
     }
     logDebug(`tools: ${toolName} returned non-standard result (missing content[]); coercing`);
     const details = "details" in record ? record.details : record;
@@ -235,7 +143,7 @@ function normalizeToolExecutionResult(params: {
 function buildToolExecutionErrorResult(params: {
   toolName: string;
   message: string;
-}): AgentToolResult<unknown> {
+}): AgentToolResult {
   return jsonResult({
     status: "error",
     tool: params.toolName,
@@ -246,7 +154,7 @@ function buildToolExecutionErrorResult(params: {
 function splitToolExecuteArgs(args: ToolExecuteArgsAny): {
   toolCallId: string;
   params: unknown;
-  onUpdate: AgentToolUpdateCallback<unknown> | undefined;
+  onUpdate: AgentToolUpdateCallback | undefined;
   signal: AbortSignal | undefined;
 } {
   if (isLegacyToolExecuteArgs(args)) {
@@ -324,7 +232,7 @@ export function toToolDefinitions(
       label: tool.label ?? name,
       description: tool.description ?? "",
       parameters: tool.parameters,
-      execute: async (...args: ToolExecuteArgs): Promise<AgentToolResult<unknown>> => {
+      execute: async (...args: ToolExecuteArgs): Promise<AgentToolResult> => {
         const { toolCallId, params, onUpdate, signal } = splitToolExecuteArgs(args);
         let executeParams = params;
         try {
@@ -367,7 +275,6 @@ export function toToolDefinitions(
             logDebug(`tools: ${normalizedName} failed stack:\n${described.stack}`);
           }
           const inputPreview = describeToolFailureInputs({
-            toolName: normalizedName,
             rawParams: params,
             effectiveParams: executeParams,
           });
@@ -429,7 +336,7 @@ export function toClientToolDefinitions(
       label: func.name,
       description: func.description ?? "",
       parameters: func.parameters as ToolDefinition["parameters"],
-      execute: async (...args: ToolExecuteArgs): Promise<AgentToolResult<unknown>> => {
+      execute: async (...args: ToolExecuteArgs): Promise<AgentToolResult> => {
         const { toolCallId, params } = splitToolExecuteArgs(args);
         if (onClientToolCall && typeof onClientToolCall !== "function") {
           onClientToolCall.reserve?.(toolCallId, func.name);

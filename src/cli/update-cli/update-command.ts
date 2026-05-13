@@ -4,10 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { confirm, isCancel } from "@clack/prompts";
-import {
-  checkShellCompletionStatus,
-  ensureCompletionCacheExists,
-} from "../../commands/doctor-completion.js";
+import { checkShellCompletionStatus } from "../../commands/doctor-completion.js";
 import { doctorCommand } from "../../commands/doctor.js";
 import {
   UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR_ENV,
@@ -33,7 +30,6 @@ import { resolveGatewayInstallEntrypoint } from "../../daemon/gateway-entrypoint
 import { disableCurrentOpenClawUpdateLaunchdJob } from "../../daemon/launchd.js";
 import { resolveGatewayRestartLogPath } from "../../daemon/restart-logs.js";
 import { summarizeGatewayServiceLayout } from "../../daemon/service-layout.js";
-import type { GatewayServiceCommandConfig } from "../../daemon/service-types.js";
 import {
   readGatewayServiceState,
   resolveGatewayService,
@@ -69,7 +65,6 @@ import {
   createGlobalInstallEnv,
   cleanupGlobalRenameDirs,
   globalInstallArgs,
-  isOpenClawSourcePackageInstallSpec,
   resolveGlobalInstallTarget,
   resolveGlobalInstallSpec,
   resolvePnpmGlobalDirFromGlobalRoot,
@@ -96,7 +91,6 @@ import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import { stylePromptMessage } from "../../terminal/prompt-style.js";
 import { theme } from "../../terminal/theme.js";
 import { resolveUserPath } from "../../utils.js";
-import { VERSION } from "../../version.js";
 import { replaceCliName, resolveCliName } from "../cli-name.js";
 import { formatCliCommand } from "../command-format.js";
 import { installCompletion } from "../completion-runtime.js";
@@ -131,7 +125,6 @@ import {
   resolveTargetVersion,
   resolveUpdateRoot,
   runUpdateStep,
-  tryWriteCompletionCache,
   type UpdateCommandOptions,
   type UpdateFinalizeOptions,
 } from "./shared.js";
@@ -752,12 +745,6 @@ type PrePackageServiceStop = {
   serviceEnv?: NodeJS.ProcessEnv;
 };
 
-type ManagedServiceRootRedirect = {
-  root: string;
-  previousRoot: string;
-  nodeRunner?: string;
-};
-
 function formatGatewayAncestryBlockMessage(pid: number): string {
   return `openclaw update detected it is running inside the gateway process tree.
 Gateway PID ${pid} is an ancestor of this process, so this updater cannot safely stop or restart the gateway that owns it.
@@ -938,7 +925,6 @@ function tryResolveInvocationCwd(): string | undefined {
 async function resolvePackageRuntimePreflightError(params: {
   tag: string;
   timeoutMs?: number;
-  nodeRunner?: string;
 }): Promise<string | null> {
   if (!canResolveRegistryVersionForPackageTarget(params.tag)) {
     return null;
@@ -954,51 +940,18 @@ async function resolvePackageRuntimePreflightError(params: {
   if (status.error) {
     return null;
   }
-  const runtime = await resolvePackageRuntimeForPreflight({
-    nodeRunner: params.nodeRunner,
-    timeoutMs: params.timeoutMs,
-  });
-  const satisfies = nodeVersionSatisfiesEngine(runtime.version, status.nodeEngine);
+  const satisfies = nodeVersionSatisfiesEngine(process.versions.node ?? null, status.nodeEngine);
   if (satisfies !== false) {
     return null;
   }
   const targetLabel = status.version ?? target;
-  const runtimeLabel = runtime.nodeRunner
-    ? `Node ${runtime.version ?? "unknown"} at ${runtime.nodeRunner}`
-    : `Node ${runtime.version ?? "unknown"}`;
   return [
-    `${runtimeLabel} is too old for openclaw@${targetLabel}.`,
+    `Node ${process.versions.node ?? "unknown"} is too old for openclaw@${targetLabel}.`,
     `The requested package requires ${status.nodeEngine}.`,
-    runtime.nodeRunner
-      ? "Upgrade the Node runtime that owns the managed Gateway service, then rerun `openclaw update`."
-      : "Upgrade Node to 22.19+ or Node 24, then rerun `openclaw update`.",
+    "Upgrade Node to 24 or newer, then rerun `openclaw update`.",
     "Bare `npm i -g openclaw` can silently install an older compatible release.",
     "After upgrading Node, use `npm i -g openclaw@latest`.",
   ].join("\n");
-}
-
-function formatUnsupportedOpenClawSourcePackageTargetMessage(target: string): string {
-  return [
-    `Unsupported package update target: ${target}.`,
-    "OpenClaw package updates use published npm artifacts or built tarballs; npm GitHub source installs for openclaw/openclaw do not reliably produce an installable package.",
-    "Use `openclaw update --channel dev` for the moving main checkout, or target `latest`, `beta`, an exact version, or a built `.tgz` package spec.",
-  ].join("\n");
-}
-
-async function resolvePackageRuntimeForPreflight(params: {
-  nodeRunner?: string;
-  timeoutMs?: number;
-}): Promise<{ version: string | null; nodeRunner?: string }> {
-  const nodeRunner = normalizeOptionalString(params.nodeRunner);
-  if (!nodeRunner) {
-    return { version: process.versions.node ?? null };
-  }
-  const res = await runCommandWithTimeout([nodeRunner, "--version"], {
-    timeoutMs: Math.min(params.timeoutMs ?? 10_000, 10_000),
-  }).catch(() => null);
-  const rawVersion = res?.code === 0 ? res.stdout.trim() : "";
-  const version = rawVersion.replace(/^v/u, "") || null;
-  return { version, nodeRunner };
 }
 
 function resolveServiceRefreshEnv(
@@ -1137,7 +1090,6 @@ async function refreshGatewayServiceEnv(params: {
   jsonMode: boolean;
   invocationCwd?: string;
   env?: NodeJS.ProcessEnv;
-  nodeRunner?: string;
 }): Promise<void> {
   const args = ["gateway", "install", "--force"];
   if (params.jsonMode) {
@@ -1146,14 +1098,11 @@ async function refreshGatewayServiceEnv(params: {
 
   const entrypoint = await resolveGatewayInstallEntrypoint(params.result.root);
   if (entrypoint) {
-    const res = await runCommandWithTimeout(
-      [params.nodeRunner ?? resolveNodeRunner(), entrypoint, ...args],
-      {
-        cwd: params.result.root,
-        env: resolveUpdatedInstallCommandEnv(params.env ?? process.env, params.invocationCwd),
-        timeoutMs: SERVICE_REFRESH_TIMEOUT_MS,
-      },
-    );
+    const res = await runCommandWithTimeout([resolveNodeRunner(), entrypoint, ...args], {
+      cwd: params.result.root,
+      env: resolveUpdatedInstallCommandEnv(params.env ?? process.env, params.invocationCwd),
+      timeoutMs: SERVICE_REFRESH_TIMEOUT_MS,
+    });
     if (res.code === 0) {
       return;
     }
@@ -1176,7 +1125,6 @@ async function runUpdatedInstallGatewayRestart(params: {
   jsonMode: boolean;
   invocationCwd?: string;
   env?: NodeJS.ProcessEnv;
-  nodeRunner?: string;
 }): Promise<boolean> {
   const entrypoint = await resolveGatewayInstallEntrypoint(params.result.root);
   if (!entrypoint) {
@@ -1189,14 +1137,11 @@ async function runUpdatedInstallGatewayRestart(params: {
   if (params.jsonMode) {
     args.push("--json");
   }
-  const res = await runCommandWithTimeout(
-    [params.nodeRunner ?? resolveNodeRunner(), entrypoint, ...args],
-    {
-      cwd: params.result.root,
-      env: resolveUpdatedInstallCommandEnv(params.env ?? process.env, params.invocationCwd),
-      timeoutMs: SERVICE_REFRESH_TIMEOUT_MS,
-    },
-  );
+  const res = await runCommandWithTimeout([resolveNodeRunner(), entrypoint, ...args], {
+    cwd: params.result.root,
+    env: resolveUpdatedInstallCommandEnv(params.env ?? process.env, params.invocationCwd),
+    timeoutMs: SERVICE_REFRESH_TIMEOUT_MS,
+  });
   if (res.code === 0) {
     return true;
   }
@@ -1215,18 +1160,11 @@ async function tryInstallShellCompletion(opts: {
 
   const status = await checkShellCompletionStatus(CLI_NAME);
 
-  if (status.usesSlowPattern) {
-    defaultRuntime.log(theme.muted("Upgrading shell completion to cached version..."));
-    const cacheGenerated = await ensureCompletionCacheExists(CLI_NAME);
-    if (cacheGenerated) {
-      await installCompletion(status.shell, true, CLI_NAME);
-    }
-    return;
-  }
-
-  if (status.profileInstalled && !status.cacheExists) {
-    defaultRuntime.log(theme.muted("Regenerating shell completion cache..."));
-    await ensureCompletionCacheExists(CLI_NAME);
+  if (status.usesRetiredCache) {
+    defaultRuntime.log(theme.muted("Updating shell completion profile..."));
+    await installCompletion(status.shell, true, CLI_NAME, {
+      retiredCachePath: status.retiredCachePath,
+    });
     return;
   }
 
@@ -1250,12 +1188,6 @@ async function tryInstallShellCompletion(opts: {
       return;
     }
 
-    const cacheGenerated = await ensureCompletionCacheExists(CLI_NAME);
-    if (!cacheGenerated) {
-      defaultRuntime.log(theme.warn("Failed to generate completion cache."));
-      return;
-    }
-
     await installCompletion(status.shell, opts.skipPrompt, CLI_NAME);
   }
 }
@@ -1268,54 +1200,9 @@ async function tryRealpathOrResolve(value: string): Promise<string> {
   }
 }
 
-function isNodeExecutable(value: string | undefined): boolean {
-  const base = normalizeOptionalString(value ? path.basename(value) : undefined)?.toLowerCase();
-  return base === "node" || base === "node.exe";
-}
-
-function resolveManagedServiceNodeRunner(
-  command: GatewayServiceCommandConfig | null,
-): string | undefined {
-  const args = command?.programArguments;
-  if (!args?.length) {
-    return undefined;
-  }
-  const gatewayIndex = args.indexOf("gateway");
-  if (gatewayIndex <= 1) {
-    return undefined;
-  }
-  const runner = args[gatewayIndex - 2];
-  return isNodeExecutable(runner) ? runner : undefined;
-}
-
-/**
- * Resolve the node binary baked into the managed gateway service unit,
- * independent of any package root redirect. This detects when the user's
- * current PATH-resolved node differs from the service's baked node even
- * when the package root is the same.
- */
-async function resolveManagedServiceNodeRunnerOverride(): Promise<string | undefined> {
-  const command = await resolveGatewayService()
-    .readCommand(process.env)
-    .catch(() => null);
-  const serviceNode = resolveManagedServiceNodeRunner(command);
-  if (!serviceNode) {
-    return undefined;
-  }
-  const currentNode = resolveNodeRunner();
-  const [serviceNodeReal, currentNodeReal] = await Promise.all([
-    tryRealpathOrResolve(serviceNode),
-    tryRealpathOrResolve(currentNode),
-  ]);
-  if (serviceNodeReal === currentNodeReal) {
-    return undefined;
-  }
-  return serviceNode;
-}
-
 async function resolveManagedServicePackageUpdateRoot(params: {
   root: string;
-}): Promise<ManagedServiceRootRedirect | null> {
+}): Promise<{ root: string; previousRoot: string } | null> {
   const command = await resolveGatewayService()
     .readCommand(process.env)
     .catch(() => null);
@@ -1331,12 +1218,7 @@ async function resolveManagedServicePackageUpdateRoot(params: {
   if (currentRootReal === serviceRootReal) {
     return null;
   }
-  const nodeRunner = resolveManagedServiceNodeRunner(command);
-  return {
-    root: serviceRoot,
-    previousRoot: params.root,
-    ...(nodeRunner ? { nodeRunner } : {}),
-  };
+  return { root: serviceRoot, previousRoot: params.root };
 }
 
 async function runPackageInstallUpdate(params: {
@@ -1350,7 +1232,6 @@ async function runPackageInstallUpdate(params: {
   managedServiceEnv?: NodeJS.ProcessEnv;
   invocationCwd?: string;
   honorPackageRoot?: boolean;
-  nodeRunner?: string;
 }): Promise<UpdateRunResult> {
   const manager = await resolveGlobalManager({
     root: params.root,
@@ -1416,13 +1297,7 @@ async function runPackageInstallUpdate(params: {
         const candidateHostVersion = await readPackageVersion(verifiedPackageRoot);
         return await runUpdateStep({
           name: `${CLI_NAME} doctor`,
-          argv: [
-            params.nodeRunner ?? resolveNodeRunner(),
-            entryPath,
-            "doctor",
-            "--non-interactive",
-            "--fix",
-          ],
+          argv: [resolveNodeRunner(), entryPath, "doctor", "--non-interactive", "--fix"],
           cwd: verifiedPackageRoot,
           env: {
             ...resolvePostInstallDoctorEnv({
@@ -1897,7 +1772,6 @@ async function maybeRestartService(params: {
   gatewayPort: number;
   restartScriptPath?: string | null;
   invocationCwd?: string;
-  nodeRunner?: string;
 }): Promise<boolean> {
   const verifyRestartedGateway = async (expectedGatewayVersion: string | undefined) => {
     const restartAfterStaleCleanup = async () => {
@@ -1907,7 +1781,6 @@ async function maybeRestartService(params: {
           jsonMode: Boolean(params.opts.json),
           invocationCwd: params.invocationCwd,
           env: params.serviceEnv,
-          nodeRunner: params.nodeRunner,
         });
         return;
       }
@@ -2021,7 +1894,6 @@ async function maybeRestartService(params: {
             jsonMode: Boolean(params.opts.json),
             invocationCwd: params.invocationCwd,
             env: params.serviceEnv,
-            nodeRunner: params.nodeRunner,
           });
         } catch (err) {
           // Always log the refresh failure so callers can detect it (issue #56772).
@@ -2070,7 +1942,6 @@ async function maybeRestartService(params: {
           jsonMode: Boolean(params.opts.json),
           invocationCwd: params.invocationCwd,
           env: params.serviceEnv,
-          nodeRunner: params.nodeRunner,
         });
       } else if (
         !refreshedGatewayAlreadyHealthy &&
@@ -2373,23 +2244,6 @@ function createUpdatedConfigSnapshot(
   };
 }
 
-async function maybeRepairLegacyConfigForUpdateChannel(params: {
-  configSnapshot: Awaited<ReturnType<typeof readConfigFileSnapshot>>;
-  jsonMode: boolean;
-}): Promise<Awaited<ReturnType<typeof readConfigFileSnapshot>>> {
-  if (params.configSnapshot.valid || params.configSnapshot.legacyIssues.length === 0) {
-    return params.configSnapshot;
-  }
-
-  const { repairLegacyConfigForUpdateChannel } =
-    await import("../../commands/doctor/legacy-config-repair.js");
-  const { snapshot, repaired } = await repairLegacyConfigForUpdateChannel(params);
-  if (!params.jsonMode && repaired) {
-    defaultRuntime.log(theme.muted("Migrated legacy config before changing update channel."));
-  }
-  return snapshot;
-}
-
 async function writePostCorePluginUpdateResultFile(
   filePath: string | undefined,
   result: PostCorePluginUpdateResult,
@@ -2664,7 +2518,6 @@ async function continuePostCoreUpdateInFreshProcess(params: {
   pluginInstallRecords: Record<string, PluginInstallRecord>;
   preUpdateConfig?: PreUpdateConfigRestoreInput;
   updateStartedAtMs: number;
-  nodeRunner?: string;
 }): Promise<{ resumed: boolean; pluginUpdate?: PostCorePluginUpdateResult }> {
   const entryPath = await resolveGatewayInstallEntrypoint(params.root);
   if (!entryPath) {
@@ -2688,13 +2541,12 @@ async function continuePostCoreUpdateInFreshProcess(params: {
   const resultPath = path.join(resultDir, "plugins.json");
   const installRecordsPath = path.join(resultDir, "plugin-install-records.json");
   const sourceConfigPath = path.join(resultDir, "source-config.json");
-  const postCoreHostVersion = await readPackageVersion(params.root);
 
   try {
     await writePostCorePluginInstallRecordsFile(installRecordsPath, params.pluginInstallRecords);
     await writePostCoreSourceConfigFile(sourceConfigPath, params.preUpdateConfig);
     const childStdio = resolvePostCoreUpdateChildStdio();
-    const child = spawn(params.nodeRunner ?? resolveNodeRunner(), argv, {
+    const child = spawn(resolveNodeRunner(), argv, {
       stdio: childStdio,
       env: {
         ...stripGatewayServiceMarkerEnv(disableUpdatedPackageCompileCacheEnv(process.env)),
@@ -2706,9 +2558,6 @@ async function continuePostCoreUpdateInFreshProcess(params: {
         [POST_CORE_UPDATE_RESULT_PATH_ENV]: resultPath,
         [POST_CORE_UPDATE_INSTALL_RECORDS_PATH_ENV]: installRecordsPath,
         [POST_CORE_UPDATE_STARTED_AT_ENV]: String(params.updateStartedAtMs),
-        ...(postCoreHostVersion === null
-          ? {}
-          : { OPENCLAW_COMPATIBILITY_HOST_VERSION: postCoreHostVersion }),
         ...(params.preUpdateConfig
           ? { [POST_CORE_UPDATE_SOURCE_CONFIG_PATH_ENV]: sourceConfigPath }
           : {}),
@@ -2896,8 +2745,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
       return;
     }
 
-    process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION = (await readPackageVersion(root)) ?? VERSION;
-
     let postCoreConfigSnapshot = await readConfigFileSnapshot({ skipPluginValidation: true });
     const preUpdateSourceConfig = await readPostCorePreUpdateSourceConfig({
       sourceConfigPath: process.env[POST_CORE_UPDATE_SOURCE_CONFIG_PATH_ENV],
@@ -3007,52 +2854,16 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
   let fallbackToLatest = false;
   let packageInstallSpec: string | null = null;
   let packageAlreadyCurrent = false;
-  let managedServiceRootRedirect: ManagedServiceRootRedirect | null = null;
-  // Resolved independently of the root redirect so it covers the common case
-  // where the package root is the same but the user's PATH-resolved node
-  // differs from the node baked into the managed gateway service unit.
-  let managedServiceNodeRunner: string | undefined;
+  let managedServiceRootRedirect: { root: string; previousRoot: string } | null = null;
 
   if (updateInstallKind === "package") {
     managedServiceRootRedirect = await resolveManagedServicePackageUpdateRoot({ root });
     if (managedServiceRootRedirect) {
       root = managedServiceRootRedirect.root;
-      managedServiceNodeRunner = managedServiceRootRedirect.nodeRunner;
       if (!opts.json) {
         defaultRuntime.log(
           theme.muted(
             `Targeting managed gateway service package root: ${managedServiceRootRedirect.root}`,
-          ),
-        );
-        defaultRuntime.log(
-          theme.warn(
-            `Shell OpenClaw root differs from the managed gateway service root: ${managedServiceRootRedirect.previousRoot}`,
-          ),
-        );
-        defaultRuntime.log(
-          theme.muted(
-            `After the update, make sure \`${CLI_NAME}\` on PATH resolves to the managed service root or reinstall the gateway service from the shell install you want to use.`,
-          ),
-        );
-        if (managedServiceNodeRunner) {
-          defaultRuntime.log(
-            theme.muted(`Managed gateway service Node: ${managedServiceNodeRunner}`),
-          );
-        }
-      }
-    } else {
-      // Roots match but the node binary may still differ (e.g. user switched
-      // nvm/fnm/brew node after gateway install).
-      managedServiceNodeRunner = await resolveManagedServiceNodeRunnerOverride();
-      if (managedServiceNodeRunner && !opts.json) {
-        defaultRuntime.log(
-          theme.warn(
-            `Current Node (${resolveNodeRunner()}) differs from the managed gateway service Node (${managedServiceNodeRunner}).`,
-          ),
-        );
-        defaultRuntime.log(
-          theme.muted(
-            `Using the managed service Node for this update so the gateway can start after the upgrade.`,
           ),
         );
       }
@@ -3089,11 +2900,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
       tag,
       env: process.env,
     });
-    if (isOpenClawSourcePackageInstallSpec(packageInstallSpec)) {
-      defaultRuntime.error(formatUnsupportedOpenClawSourcePackageTargetMessage(packageInstallSpec));
-      defaultRuntime.exit(1);
-      return;
-    }
   }
 
   if (opts.dryRun) {
@@ -3126,7 +2932,7 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
       actions.push(`Run global package manager update with spec ${packageInstallSpec ?? tag}`);
     }
     actions.push("Run plugin update sync after core update");
-    actions.push("Refresh shell completion cache (if needed)");
+    actions.push("Refresh shell completion profile (if needed)");
     actions.push(
       shouldRestart
         ? "Restart gateway service and run doctor checks"
@@ -3211,7 +3017,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
     const runtimePreflightError = await resolvePackageRuntimePreflightError({
       tag,
       timeoutMs,
-      nodeRunner: managedServiceNodeRunner,
     });
     if (runtimePreflightError) {
       defaultRuntime.error(runtimePreflightError);
@@ -3279,9 +3084,7 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
             jsonMode: Boolean(opts.json),
             managedServiceEnv: prePackageServiceStop?.serviceEnv,
             invocationCwd,
-            honorPackageRoot:
-              managedServiceRootRedirect !== null || managedServiceNodeRunner !== undefined,
-            nodeRunner: managedServiceNodeRunner,
+            honorPackageRoot: managedServiceRootRedirect !== null,
           })
         : await runGitUpdate({
             root,
@@ -3407,7 +3210,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
       opts,
       pluginInstallRecords: preUpdatePluginInstallRecords,
       updateStartedAtMs: startedAt,
-      nodeRunner: managedServiceNodeRunner,
       preUpdateConfig: configSnapshot.valid
         ? {
             sourceConfig: configSnapshot.sourceConfig,
@@ -3512,7 +3314,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
     }
   }
 
-  await tryWriteCompletionCache(postUpdateRoot, Boolean(opts.json));
   await tryInstallShellCompletion({
     jsonMode: Boolean(opts.json),
     skipPrompt: Boolean(opts.yes),
@@ -3533,7 +3334,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
     gatewayPort,
     restartScriptPath,
     invocationCwd,
-    nodeRunner: managedServiceNodeRunner,
   });
   if (!restartOk) {
     await markControlPlaneUpdateRestartSentinelFailureBestEffort({

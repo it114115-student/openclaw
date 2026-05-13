@@ -39,23 +39,25 @@ import {
   dispatchGatewayMethodInProcess,
   getGlobalHookRunner,
   isEmbeddedPiRunActive,
+  getSessionEntry,
   getRuntimeConfig,
   formatEmbeddedPiQueueFailureSummary,
-  loadSessionStore,
-  queueEmbeddedPiMessageWithOutcomeAsync,
+  isSteeringQueueMode,
+  queueEmbeddedPiMessageWithOutcome,
+  resolvePiSteeringModeForQueueMode,
   resolveActiveEmbeddedRunSessionId,
   resolveAgentIdFromSessionKey,
   resolveConversationIdFromTargets,
   resolveExternalBestEffortDeliveryTarget,
   resolveQueueSettings,
-  resolveStorePath,
 } from "./subagent-announce-delivery.runtime.js";
 import {
   runSubagentAnnounceDispatch,
   type SubagentAnnounceDeliveryResult,
 } from "./subagent-announce-dispatch.js";
-import type { DeliveryContext } from "./subagent-announce-origin.js";
-import { getSubagentDepthFromSessionStore } from "./subagent-depth.js";
+import { resolveAnnounceOrigin, type DeliveryContext } from "./subagent-announce-origin.js";
+import { type AnnounceQueueItem, enqueueAnnounce } from "./subagent-announce-queue.js";
+import { getSubagentDepthFromSessionEntries } from "./subagent-depth.js";
 import { resolveRequesterStoreKey } from "./subagent-requester-store-key.js";
 import type { SpawnSubagentMode } from "./subagent-spawn.types.js";
 
@@ -218,7 +220,7 @@ export function resolveSubagentAnnounceTimeoutMs(cfg: OpenClawConfig): number {
 }
 
 export function isInternalAnnounceRequesterSession(sessionKey: string | undefined): boolean {
-  return getSubagentDepthFromSessionStore(sessionKey) >= 1 || isCronSessionKey(sessionKey);
+  return getSubagentDepthFromSessionEntries(sessionKey) >= 1 || isCronSessionKey(sessionKey);
 }
 
 function summarizeDeliveryError(error: unknown): string {
@@ -273,13 +275,6 @@ function isTransientAnnounceDeliveryError(error: unknown): boolean {
     return false;
   }
   return TRANSIENT_ANNOUNCE_DELIVERY_ERROR_PATTERNS.some((re) => re.test(message));
-}
-
-function isPermanentAnnounceDeliveryError(error: unknown): boolean {
-  const message = summarizeDeliveryError(error);
-  return Boolean(
-    message && PERMANENT_ANNOUNCE_DELIVERY_ERROR_PATTERNS.some((re) => re.test(message)),
-  );
 }
 
 async function waitForAnnounceRetryDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -433,18 +428,19 @@ export function loadRequesterSessionEntry(requesterSessionKey: string) {
   const cfg = subagentAnnounceDeliveryDeps.getRuntimeConfig();
   const canonicalKey = resolveRequesterStoreKey(cfg, requesterSessionKey);
   const agentId = resolveAgentIdFromSessionKey(canonicalKey);
-  const storePath = resolveStorePath(cfg.session?.store, { agentId });
-  const store = loadSessionStore(storePath);
-  const entry = store[canonicalKey];
-  return { cfg, entry, canonicalKey };
+  const entry = getSessionEntry({ agentId, sessionKey: canonicalKey });
+  const deliveryContext = normalizeDeliveryContext({
+    channel: entry?.lastChannel ?? entry?.deliveryContext?.channel,
+    to: entry?.lastTo ?? entry?.deliveryContext?.to,
+    accountId: entry?.lastAccountId ?? entry?.deliveryContext?.accountId,
+    threadId: entry?.lastThreadId ?? entry?.deliveryContext?.threadId,
+  });
+  return { cfg, entry, deliveryContext, canonicalKey };
 }
 
 export function loadSessionEntryByKey(sessionKey: string) {
-  const cfg = subagentAnnounceDeliveryDeps.getRuntimeConfig();
   const agentId = resolveAgentIdFromSessionKey(sessionKey);
-  const storePath = resolveStorePath(cfg.session?.store, { agentId });
-  const store = loadSessionStore(storePath);
-  return store[sessionKey];
+  return getSessionEntry({ agentId, sessionKey });
 }
 
 async function maybeSteerSubagentAnnounce(params: {
@@ -467,7 +463,7 @@ async function maybeSteerSubagentAnnounce(params: {
 
   const queueSettings = resolveQueueSettings({
     cfg,
-    channel: entry?.channel ?? entry?.lastChannel ?? entry?.origin?.provider,
+    channel: entry?.lastChannel ?? entry?.deliveryContext?.channel,
     sessionEntry: entry,
   });
 
@@ -690,8 +686,7 @@ async function sendSubagentAnnounceDirectly(params: {
       cfg,
       channel:
         requesterEntry?.channel ??
-        requesterEntry?.lastChannel ??
-        requesterEntry?.origin?.provider ??
+        requesterEntry?.deliveryContext?.channel ??
         requesterSessionOrigin?.channel ??
         directOrigin?.channel,
       sessionEntry: requesterEntry,
