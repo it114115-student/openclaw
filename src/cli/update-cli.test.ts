@@ -464,9 +464,9 @@ describe("update-cli", () => {
       return {
         path: snapshot.path,
         previousHash: snapshot.hash ?? null,
+        persistedHash: snapshot.hash ?? null,
         snapshot,
         nextConfig,
-        persistedHash: snapshot.hash ?? null,
         result: undefined,
         attempts: 1,
         afterWrite: { mode: "none", reason: "test" },
@@ -1268,9 +1268,9 @@ describe("update-cli", () => {
       return {
         path: newerSnapshot.path,
         previousHash: newerSnapshot.hash,
+        persistedHash: newerSnapshot.hash,
         snapshot: newerSnapshot,
         nextConfig,
-        persistedHash: newerSnapshot.hash,
         result: undefined,
         attempts: 2,
         afterWrite: { mode: "none", reason: "test" },
