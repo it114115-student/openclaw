@@ -113,6 +113,21 @@ async function resolveQueueEmbeddedPiMessageOutcome(
   );
 }
 
+async function runAnnounceAgentCall(params: {
+  agentParams: Record<string, unknown>;
+  expectFinal?: boolean;
+  timeoutMs?: number;
+}): Promise<unknown> {
+  return await subagentAnnounceDeliveryDeps.dispatchGatewayMethodInProcess(
+    "agent",
+    params.agentParams,
+    {
+      expectFinal: params.expectFinal,
+      timeoutMs: params.timeoutMs,
+    },
+  );
+}
+
 function formatQueueWakeFailureError(
   fallback: string,
   outcome: EmbeddedPiQueueMessageOutcome,
@@ -259,6 +274,13 @@ function isTransientAnnounceDeliveryError(error: unknown): boolean {
     return false;
   }
   return TRANSIENT_ANNOUNCE_DELIVERY_ERROR_PATTERNS.some((re) => re.test(message));
+}
+
+function isPermanentAnnounceDeliveryError(error: unknown): boolean {
+  const message = summarizeDeliveryError(error);
+  return Boolean(
+    message && PERMANENT_ANNOUNCE_DELIVERY_ERROR_PATTERNS.some((re) => re.test(message)),
+  );
 }
 
 async function waitForAnnounceRetryDelay(ms: number, signal?: AbortSignal): Promise<void> {
