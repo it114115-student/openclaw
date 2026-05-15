@@ -940,6 +940,14 @@ export async function runCodexAppServerAttempt(
     agentId: sessionAgentId,
     sessionId: activeSessionId,
   });
+  const hookContextWindowFields = {
+    ...(params.contextWindowInfo?.source
+      ? { contextWindowSource: params.contextWindowInfo.source }
+      : {}),
+    ...(params.contextWindowInfo?.referenceTokens
+      ? { contextWindowReferenceTokens: params.contextWindowInfo.referenceTokens }
+      : {}),
+  };
   let historyMessages =
     (await readMirroredSessionHistoryMessages({
       agentId: sessionAgentId,
@@ -2268,11 +2276,17 @@ export async function runCodexAppServerAttempt(
           error: formatErrorMessage(turnStartError),
         },
       );
-      const preRetrySessionFile = activeSessionFile;
+      const preRetrySessionId = activeSessionId;
       const compactedForRetry = await forceContextEngineCompactionForCodexOverflow(turnStartError);
-      await clearCodexAppServerBinding(preRetrySessionFile);
-      if (activeSessionFile !== preRetrySessionFile) {
-        await clearCodexAppServerBinding(activeSessionFile);
+      await clearCodexAppServerBinding({
+        sessionKey: sandboxSessionKey,
+        sessionId: preRetrySessionId,
+      });
+      if (activeSessionId !== preRetrySessionId) {
+        await clearCodexAppServerBinding({
+          sessionKey: sandboxSessionKey,
+          sessionId: activeSessionId,
+        });
       }
       if (compactedForRetry) {
         await rebuildPromptAfterContextEngineCompaction();
