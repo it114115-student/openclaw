@@ -1177,7 +1177,10 @@ describe("runCodexAppServerAttempt", () => {
       createRuntimeDynamicTool("sessions_yield"),
     ]);
     const harness = createStartedThreadHarness();
-    const params = createParams("session", path.join(tempDir, "workspace"));
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
     params.disableTools = false;
     params.runtimePlan = createCodexRuntimePlanFixture();
     params.sourceReplyDeliveryMode = "message_tool_only";
@@ -1350,7 +1353,10 @@ describe("runCodexAppServerAttempt", () => {
       createRuntimeDynamicTool("web_search"),
     ]);
     const harness = createStartedThreadHarness();
-    const params = createParams("session", path.join(tempDir, "workspace"));
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
     params.disableTools = false;
     params.runtimePlan = createCodexRuntimePlanFixture();
     params.sourceReplyDeliveryMode = "message_tool_only";
@@ -1885,7 +1891,10 @@ describe("runCodexAppServerAttempt", () => {
           },
         }) as never,
     );
-    const params = createParams("session", path.join(tempDir, "workspace"));
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
     params.timeoutMs = 60_000;
 
     const run = runCodexAppServerAttempt(params, {
@@ -2903,7 +2912,10 @@ describe("runCodexAppServerAttempt", () => {
           },
         }) as never,
     );
-    const params = createParams("session", path.join(tempDir, "workspace"));
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
     params.timeoutMs = 60_000;
 
     const run = runCodexAppServerAttempt(params, {
