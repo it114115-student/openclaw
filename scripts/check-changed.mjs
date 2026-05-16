@@ -165,6 +165,8 @@ export function createChangedCheckPlan(result, options = {}) {
   add("guarded extension wildcard re-exports", ["lint:extensions:no-guarded-wildcard-reexports"]);
   add("plugin-sdk wildcard re-exports", ["lint:extensions:no-plugin-sdk-wildcard-reexports"]);
   add("duplicate scan target coverage", ["dup:check:coverage"]);
+  add("dependency pin guard", ["deps:pins:check"]);
+  add("package patch guard", ["deps:patches:check"]);
   if (result.paths.some((changedPath) => KYSELY_CODEGEN_PATHS.has(changedPath))) {
     add("Kysely generated database types", ["db:kysely:check"]);
   }
