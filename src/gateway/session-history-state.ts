@@ -37,6 +37,7 @@ type InlineSessionHistoryAppend = {
 
 type SessionHistoryTranscriptTarget = {
   agentId?: string;
+  path?: string;
   sessionId: string;
 };
 
@@ -301,6 +302,7 @@ export class SessionHistorySseState {
       const snapshot = await readRecentSessionMessagesWithStatsAsync(
         {
           agentId: this.target.agentId,
+          path: this.target.path,
           sessionId: this.target.sessionId,
         },
         {
@@ -317,6 +319,7 @@ export class SessionHistorySseState {
       rawMessages: await readSessionMessagesAsync(
         {
           agentId: this.target.agentId,
+          path: this.target.path,
           sessionId: this.target.sessionId,
         },
         {
