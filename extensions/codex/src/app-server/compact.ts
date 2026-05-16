@@ -16,8 +16,7 @@ import {
 import type { CodexAppServerClient, CodexServerNotificationHandler } from "./client.js";
 import { resolveCodexAppServerRuntimeOptions } from "./config.js";
 import { isJsonObject, type CodexServerNotification, type JsonObject } from "./protocol.js";
-import { resolveCodexNativeSandboxBlock } from "./sandbox-guard.js";
-import { clearCodexAppServerBinding, readCodexAppServerBinding } from "./session-binding.js";
+import { readCodexAppServerBinding } from "./session-binding.js";
 type CodexNativeCompactionCompletion = {
   signal: "thread/compacted" | "item/completed";
   turnId?: string;
@@ -42,25 +41,27 @@ export async function maybeCompactCodexAppServerSession(
   const activeContextEngine = isActiveHarnessContextEngine(params.contextEngine)
     ? params.contextEngine
     : undefined;
-  if (activeContextEngine?.info.ownsCompaction) {
-    return await compactOwningContextEngine(params, activeContextEngine);
-  }
   warnIfIgnoringOpenClawCompactionOverrides(params);
   if (activeContextEngine?.info.ownsCompaction) {
     let primary: ContextEngineCompactResult | undefined;
     let primaryError: string | undefined;
     try {
-      primary = await activeContextEngine.compact({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        transcriptScope: { agentId: params.agentId ?? "main", sessionId: params.sessionId },
-        tokenBudget: params.contextTokenBudget,
-        currentTokenCount: params.currentTokenCount,
-        compactionTarget: params.trigger === "manual" ? "threshold" : "budget",
-        customInstructions: params.customInstructions,
-        force: params.trigger === "manual",
-        runtimeContext: params.contextEngineRuntimeContext,
-      });
+      primary = await compactContextEngineWithSafetyTimeout(
+        activeContextEngine,
+        {
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          transcriptScope: { agentId: params.agentId ?? "main", sessionId: params.sessionId },
+          tokenBudget: params.contextTokenBudget,
+          currentTokenCount: params.currentTokenCount,
+          compactionTarget: params.trigger === "manual" ? "threshold" : "budget",
+          customInstructions: params.customInstructions,
+          force: params.trigger === "manual",
+          runtimeContext: params.contextEngineRuntimeContext,
+        },
+        resolveCompactionTimeoutMs(params.config),
+        params.abortSignal,
+      );
     } catch (error) {
       primaryError = formatErrorMessage(error);
       embeddedAgentLog.warn(
@@ -110,129 +111,6 @@ export async function maybeCompactCodexAppServerSession(
     };
   }
   return await compactCodexNativeThread(params, options);
-}
-
-async function compactOwningContextEngine(
-  params: CompactEmbeddedPiSessionParams,
-  contextEngine: NonNullable<CompactEmbeddedPiSessionParams["contextEngine"]>,
-): Promise<EmbeddedPiCompactResult> {
-  embeddedAgentLog.info("starting context-engine-owned Codex app-server compaction", {
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    engineId: contextEngine.info.id,
-    tokenBudget: params.contextTokenBudget,
-    currentTokenCount: params.currentTokenCount,
-    trigger: params.trigger,
-    compactionTarget: params.trigger === "manual" ? "threshold" : "budget",
-    force: params.trigger === "manual",
-  });
-  let result: Awaited<ReturnType<typeof contextEngine.compact>>;
-  try {
-    // Bound the plugin-owned compaction with the same finite safety timeout
-    // that protects native runtime compaction, and thread the caller's abort
-    // signal through, so a slow/hung plugin compact() cannot hang the Codex
-    // compaction lane indefinitely. A timeout/abort (or any thrown error) is
-    // converted to a clean { ok: false } result by the catch below.
-    result = await compactContextEngineWithSafetyTimeout(
-      contextEngine,
-      {
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        tokenBudget: params.contextTokenBudget,
-        currentTokenCount: params.currentTokenCount,
-        compactionTarget: params.trigger === "manual" ? "threshold" : "budget",
-        customInstructions: params.customInstructions,
-        force: params.trigger === "manual",
-        runtimeContext: params.contextEngineRuntimeContext,
-      },
-      resolveCompactionTimeoutMs(params.config),
-      params.abortSignal,
-    );
-  } catch (error) {
-    embeddedAgentLog.warn("context-engine-owned Codex app-server compaction failed", {
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-      engineId: contextEngine.info.id,
-      error: formatErrorMessage(error),
-    });
-    return {
-      ok: false,
-      compacted: false,
-      reason: `context engine compaction failed: ${formatErrorMessage(error)}`,
-    };
-  }
-
-  if (result.ok && result.compacted) {
-    const compactedSessionId = result.result?.sessionId ?? params.sessionId;
-    const compactedSessionFile = result.result?.sessionFile ?? params.sessionFile;
-    try {
-      await runHarnessContextEngineMaintenance({
-        contextEngine,
-        sessionId: compactedSessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: compactedSessionFile,
-        reason: "compaction",
-        runtimeContext: params.contextEngineRuntimeContext,
-        config: params.config,
-      });
-    } catch (error) {
-      embeddedAgentLog.warn("context engine compaction maintenance failed", {
-        sessionId: compactedSessionId,
-        engineId: contextEngine.info.id,
-        error: formatErrorMessage(error),
-      });
-    }
-    await clearCodexAppServerBinding(params.sessionFile);
-    if (compactedSessionFile !== params.sessionFile) {
-      await clearCodexAppServerBinding(compactedSessionFile);
-    }
-  }
-
-  embeddedAgentLog.info("completed context-engine-owned Codex app-server compaction", {
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    engineId: contextEngine.info.id,
-    ok: result.ok,
-    compacted: result.compacted,
-    reason: result.reason,
-    codexThreadBindingInvalidated: result.ok && result.compacted,
-  });
-  return {
-    ok: result.ok,
-    compacted: result.compacted,
-    reason: result.reason,
-    result: result.result
-      ? {
-          ...result.result,
-          summary: result.result.summary ?? "",
-          firstKeptEntryId: result.result.firstKeptEntryId ?? "",
-          details: mergeContextEngineCompactionDetails(result.result.details, {
-            codexThreadBindingInvalidated: result.ok && result.compacted,
-          }),
-        }
-      : result.ok && result.compacted
-        ? {
-            summary: "",
-            firstKeptEntryId: "",
-            tokensBefore: params.currentTokenCount ?? 0,
-            details: { codexThreadBindingInvalidated: true },
-          }
-        : undefined,
-  };
-}
-
-function mergeContextEngineCompactionDetails(
-  details: unknown,
-  extra: Record<string, unknown>,
-): unknown {
-  if (details && typeof details === "object" && !Array.isArray(details)) {
-    return {
-      ...(details as Record<string, unknown>),
-      ...extra,
-    };
-  }
-  return extra;
 }
 
 function warnIfIgnoringOpenClawCompactionOverrides(params: CompactEmbeddedPiSessionParams): void {
@@ -369,15 +247,6 @@ async function compactCodexNativeThread(
   params: CompactEmbeddedPiSessionParams,
   options: { pluginConfig?: unknown; clientFactory?: CodexAppServerClientFactory } = {},
 ): Promise<EmbeddedPiCompactResult | undefined> {
-  const sandboxBlock = resolveCodexNativeSandboxBlock({
-    config: params.config,
-    sessionKey: params.sandboxSessionKey ?? params.sessionKey,
-    sessionId: params.sessionId,
-    surface: "native compaction",
-  });
-  if (sandboxBlock) {
-    return { ok: false, compacted: false, reason: sandboxBlock };
-  }
   const appServer = resolveCodexAppServerRuntimeOptions({ pluginConfig: options.pluginConfig });
   const binding = await readCodexAppServerBinding(
     { sessionKey: params.sessionKey, sessionId: params.sessionId },
