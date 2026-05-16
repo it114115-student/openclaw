@@ -14,7 +14,6 @@ import {
   resolvePublicAgentAvatarSource,
 } from "../../agents/identity-avatar.js";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
-import { resolveTrustedGroupId } from "../../agents/pi-tools.policy.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import { resolveSandboxConfigForAgent } from "../../agents/sandbox/config.js";
 import {
