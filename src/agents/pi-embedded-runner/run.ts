@@ -861,7 +861,7 @@ export async function runEmbeddedPiAgent(
         return runtimeAuthPlan.forwardedAuthProfileId === profileId;
       };
       const resolvePluginHarnessProfileOrder = (): string[] => {
-        if (requestedProfileId) {
+        if (requestedProfileId && params.authProfileIdSource === "user") {
           return isForwardablePluginHarnessAuthProfile(requestedProfileId)
             ? [requestedProfileId]
             : [];
@@ -885,8 +885,12 @@ export async function runEmbeddedPiAgent(
           cfg: params.config,
           store: attemptAuthProfileStore,
           provider: harnessAuthProvider,
+          preferredProfile: requestedProfileId,
         }).filter(isForwardablePluginHarnessAuthProfile);
-        return resolvedOrder;
+        if (resolvedOrder.length > 0) {
+          return resolvedOrder;
+        }
+        return requestedProfileId ? [requestedProfileId] : [];
       };
       const pluginHarnessProfileOrder = pluginHarnessOwnsTransport
         ? resolvePluginHarnessProfileOrder()
