@@ -1074,6 +1074,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         entry,
         canonicalKey,
         agentId: sessionAgentId,
+        databasePath,
       } = loadSessionEntry(requestedSessionKey);
       cfgForAgent = cfg;
       const now = Date.now();
@@ -1099,6 +1100,7 @@ export const agentHandlers: GatewayRequestHandlers = {
             ...resolveSessionLifecycleTimestamps({
               entry,
               agentId: resolveAgentIdFromSessionKey(canonicalKey),
+              databasePath,
             }),
             now,
             policy: resetPolicy,
@@ -1213,6 +1215,7 @@ export const agentHandlers: GatewayRequestHandlers = {
             resolveSessionLifecycleTimestamps({
               entry,
               agentId: resolveAgentIdFromSessionKey(canonicalKey),
+              databasePath,
             }).sessionStartedAt),
         lastInteractionAt: touchInteraction ? now : entry?.lastInteractionAt,
         thinkingLevel: entry?.thinkingLevel,
