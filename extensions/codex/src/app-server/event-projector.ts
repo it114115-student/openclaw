@@ -783,6 +783,9 @@ export class CodexAppServerEventProjector {
     if (!item || readString(item, "role") !== "assistant") {
       return;
     }
+    if (readString(item, "phase") === "commentary") {
+      return;
+    }
     const text = extractRawAssistantText(item);
     if (!text) {
       return;

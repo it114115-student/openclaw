@@ -679,7 +679,7 @@ function maxFiniteNumber(values: Array<number | undefined>): number | undefined 
 async function rotateOversizedCodexAppServerStartupBinding(params: {
   binding: CodexAppServerThreadBinding | undefined;
   bindingIdentity: Parameters<typeof clearCodexAppServerBinding>[0];
-  sessionFile: string;
+  sessionFile?: string;
   agentDir: string;
   codexHome?: string;
   config: EmbeddedRunAttemptParams["config"] | undefined;
@@ -688,10 +688,12 @@ async function rotateOversizedCodexAppServerStartupBinding(params: {
   if (!binding?.threadId) {
     return binding;
   }
-  if (params.config?.agents?.defaults?.compaction?.truncateAfterCompaction !== true) {
+  if (params.config?.agents?.defaults?.compaction?.rotateAfterCompaction !== true) {
     return binding;
   }
-  const sessionRecord = await readCodexSessionRecordForSessionFile(params.sessionFile);
+  const sessionRecord = params.sessionFile
+    ? await readCodexSessionRecordForSessionFile(params.sessionFile)
+    : undefined;
   const maxBytes = parseCodexAppServerByteLimit(
     params.config?.agents?.defaults?.compaction?.maxActiveTranscriptBytes,
   );
@@ -826,7 +828,6 @@ export async function runCodexAppServerAttempt(
   startupBinding = await rotateOversizedCodexAppServerStartupBinding({
     binding: startupBinding,
     bindingIdentity: startupBindingIdentity,
-    sessionFile: params.sessionFile,
     agentDir,
     codexHome: appServer.start.env?.CODEX_HOME,
     config: params.config,
