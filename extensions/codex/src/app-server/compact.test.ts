@@ -325,6 +325,7 @@ describe("maybeCompactCodexAppServerSession", () => {
       force: true,
       runtimeContext: { workspaceDir: tempDir, provider: "codex" },
       transcriptScope: { agentId: "main", sessionId: "session-1" },
+      abortSignal: expect.any(AbortSignal),
     });
     expect(maintain).toHaveBeenCalledTimes(1);
     const [maintainCall] = maintain.mock.calls[0] ?? [];
