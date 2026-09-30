@@ -311,6 +311,7 @@ async function runGeminiSearch(params: {
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${params.apiKey}`,
+            "x-api-key": params.apiKey,
             ...params.headers,
           },
           body: JSON.stringify({
