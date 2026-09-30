@@ -1,7 +1,7 @@
 // Google tests cover web search provider plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { withEnvAsync, withFetchPreconnect } from "openclaw/plugin-sdk/test-env";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createGeminiWebSearchProvider } from "./src/gemini-web-search-provider.js";
 
 type TestModelProviderConfig = NonNullable<
@@ -105,7 +105,7 @@ function getGeminiFetchUrl(mockFetch: ReturnType<typeof installGeminiFetch>): st
 }
 
 function parseGeminiFetchBody(mockFetch: ReturnType<typeof installGeminiFetch>): {
-  contents?: Array<{ parts?: Array<{ text?: string }> }>;
+  contents?: Array<{ role?: string; parts?: Array<{ text?: string }> }>;
   tools?: Array<{ google_search?: { timeRangeFilter?: unknown } }>;
 } {
   const [, init] = requireFirstGeminiFetchCall(mockFetch);
@@ -114,15 +114,23 @@ function parseGeminiFetchBody(mockFetch: ReturnType<typeof installGeminiFetch>):
     throw new Error("Expected Gemini fetch body string");
   }
   return JSON.parse(body) as {
-    contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    contents?: Array<{ role?: string; parts?: Array<{ text?: string }> }>;
     tools?: Array<{ google_search?: { timeRangeFilter?: unknown } }>;
   };
 }
+
+beforeEach(() => {
+  vi.stubEnv("GEMINI_BASE_URL", "");
+  vi.stubEnv("GOOGLE_GEMINI_BASE_URL", "");
+  vi.stubEnv("GOOGLE_GEMINI_ENDPOINT", "");
+  vi.stubEnv("GEMINI_API_TYPE", "");
+});
 
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("google web search provider", () => {
@@ -897,5 +905,150 @@ describe("google web search provider", () => {
         "freshness and date_after/date_before cannot be used together. Use either freshness (day/week/month/year) or a date range (date_after/date_before), not both.",
     });
     expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("includes explicit role user in native Gemini payload for LiteLLM Vertex AI proxying", async () => {
+    const mockFetch = installGeminiFetch();
+    const provider = createGeminiWebSearchProvider();
+    const tool = provider.createTool(createGeminiToolOptions());
+
+    await tool?.execute({ query: "OpenClaw query" });
+
+    const body = parseGeminiFetchBody(mockFetch);
+    expect(body.contents?.[0]?.role).toBe("user");
+    expect(body.contents?.[0]?.parts?.[0]?.text).toBe("OpenClaw query");
+  });
+
+  it("supports private-IP self-hosted proxy baseUrl without tripping SSRF blocks", async () => {
+    const mockFetch = installGeminiFetch();
+    const provider = createGeminiWebSearchProvider();
+    const tool = provider.createTool({
+      config: {
+        plugins: {
+          entries: {
+            google: {
+              config: {
+                webSearch: {
+                  apiKey: "sk-litellm-test",
+                  baseUrl: "http://192.168.249.129:4000",
+                },
+              },
+            },
+          },
+        },
+      },
+      searchConfig: { provider: "gemini" },
+    });
+
+    const result = await tool?.execute({ query: "OpenClaw self-hosted proxy" });
+    expect(getGeminiFetchUrl(mockFetch)).toBe(
+      "http://192.168.249.129:4000/models/gemini-3.6-flash:generateContent",
+    );
+    expect(result).toMatchObject({
+      provider: "gemini",
+    });
+    expect((result as { content?: string }).content).toContain("Grounded answer");
+  });
+
+  it("falls back to GOOGLE_GEMINI_BASE_URL env var", async () => {
+    vi.stubEnv("GOOGLE_GEMINI_BASE_URL", "http://localhost:4000");
+    const mockFetch = installGeminiFetch();
+    const provider = createGeminiWebSearchProvider();
+    const tool = provider.createTool(createGeminiToolOptions());
+
+    await tool?.execute({ query: "OpenClaw query" });
+    expect(getGeminiFetchUrl(mockFetch)).toBe(
+      "http://localhost:4000/models/gemini-3.6-flash:generateContent",
+    );
+  });
+
+  it("supports openai-compatible apiType proxy routing to /chat/completions with camelCase googleSearch", async () => {
+    const mockFetch = vi.fn((_input?: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "OpenAI-compatible grounded response" } }],
+            grounding_metadata: {
+              groundingChunks: [
+                { web: { uri: "https://example.com/openai", title: "OpenAI Grounding" } },
+              ],
+            },
+          }),
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", withFetchPreconnect(mockFetch));
+
+    const provider = createGeminiWebSearchProvider();
+    const tool = provider.createTool({
+      config: {
+        plugins: {
+          entries: {
+            google: {
+              config: {
+                webSearch: {
+                  apiKey: "sk-litellm-openai-test",
+                  baseUrl: "http://192.168.249.129:4000",
+                  apiType: "openai-compatible",
+                },
+              },
+            },
+          },
+        },
+      },
+      searchConfig: { provider: "gemini" },
+    });
+
+    const result = await tool?.execute({ query: "OpenClaw openai mode" });
+    expect(getGeminiFetchUrl(mockFetch)).toBe("http://192.168.249.129:4000/chat/completions");
+
+    const [, init] = requireFirstGeminiFetchCall(mockFetch);
+    const body = JSON.parse(init?.body as string);
+    expect(body.messages).toEqual([{ role: "user", content: "OpenClaw openai mode" }]);
+    expect(body.tools).toEqual([{ googleSearch: {} }]);
+    expect(getFetchHeaders(mockFetch).authorization).toBe("Bearer sk-litellm-openai-test");
+
+    expect(result).toMatchObject({
+      provider: "gemini",
+      citations: [{ url: "https://example.com/openai", title: "OpenAI Grounding" }],
+    });
+    expect((result as { content?: string }).content).toContain(
+      "OpenAI-compatible grounded response",
+    );
+  });
+
+  it("auto-detects openai-compatible apiType when baseUrl contains /v1 and is not googleapis.com", async () => {
+    const mockFetch = vi.fn((_input?: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "Auto-detected response" } }],
+          }),
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", withFetchPreconnect(mockFetch));
+
+    const provider = createGeminiWebSearchProvider();
+    const tool = provider.createTool({
+      config: {
+        plugins: {
+          entries: {
+            google: {
+              config: {
+                webSearch: {
+                  apiKey: "sk-litellm-auto-test",
+                  baseUrl: "http://localhost:4000/v1",
+                },
+              },
+            },
+          },
+        },
+      },
+      searchConfig: { provider: "gemini" },
+    });
+
+    await tool?.execute({ query: "Auto test" });
+    expect(getGeminiFetchUrl(mockFetch)).toBe("http://localhost:4000/v1/chat/completions");
   });
 });

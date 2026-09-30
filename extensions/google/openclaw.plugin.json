@@ -940,6 +940,11 @@
       "label": "Gemini Search Base URL",
       "help": "Optional Gemini API base URL for web search grounding proxies."
     },
+    "webSearch.apiType": {
+      "label": "Gemini Search API Type",
+      "help": "Set to 'openai-compatible' for LiteLLM, OneAPI, or other OpenAI-style proxies (fallback: GEMINI_API_TYPE env var).",
+      "placeholder": "gemini"
+    },
     "webSearch.headers": {
       "label": "Gemini Search Headers",
       "help": "Optional headers merged into Gemini web search requests. Use a SecretRef value when a header contains a secret.",
@@ -1001,6 +1006,10 @@
           },
           "baseUrl": {
             "type": "string"
+          },
+          "apiType": {
+            "type": "string",
+            "enum": ["gemini", "openai-compatible"]
           },
           "headers": {
             "type": "object",

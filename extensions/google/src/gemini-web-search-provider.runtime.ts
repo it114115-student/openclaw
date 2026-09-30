@@ -21,7 +21,7 @@ import {
   resolveSearchCacheTtlMs,
   resolveSearchTimeoutSeconds,
   type SearchConfigRecord,
-  withTrustedWebSearchEndpoint,
+  withSelfHostedWebSearchEndpoint,
   wrapWebContent,
   writeCachedSearchPayload,
 } from "openclaw/plugin-sdk/provider-web-search";
@@ -32,6 +32,7 @@ import {
   resolveGeminiConfig,
   resolveGeminiBaseUrl,
   resolveGeminiModel,
+  resolveGeminiApiType,
   type GeminiConfig,
 } from "./gemini-web-search-provider.shared.js";
 
@@ -63,6 +64,35 @@ const GEMINI_UNSAFE_REQUEST_HEADER_NAMES = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
+
+type OpenAICompatibleChatResponse = {
+  choices?: Array<{
+    message?: {
+      content?: string;
+    };
+  }>;
+  grounding_metadata?: {
+    groundingChunks?: Array<{
+      web?: {
+        uri?: string;
+        title?: string;
+      };
+    }>;
+  };
+  candidates?: Array<{
+    groundingMetadata?: {
+      groundingChunks?: Array<{
+        web?: {
+          uri?: string;
+          title?: string;
+        };
+      }>;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
+};
 
 function throwMalformedGeminiResponse(): never {
   throw new Error("Gemini API error: malformed JSON response");
@@ -182,7 +212,7 @@ function resolveGeminiTimeRangeFilter(
 function resolveGeminiRuntimeApiKey(gemini?: GeminiConfig): string | undefined {
   return (
     readConfiguredSecretString(gemini?.apiKey, "plugins.entries.google.config.webSearch.apiKey") ??
-    readProviderEnvValue(["GEMINI_API_KEY"]) ??
+    readProviderEnvValue(["GEMINI_API_KEY", "GOOGLE_API_KEY"]) ??
     readConfiguredSecretString(gemini?.providerApiKey, "models.providers.google.apiKey")
   );
 }
@@ -255,21 +285,88 @@ async function runGeminiSearch(params: {
   apiKey: string;
   baseUrl: string;
   model: string;
+  apiType: "gemini" | "openai-compatible";
   timeoutSeconds: number;
   signal?: AbortSignal;
   timeRangeFilter?: GeminiTimeRangeFilter;
   headers?: Record<string, string>;
 }): Promise<{ content: string; citations: Array<{ url: string; title?: string }> }> {
-  const endpoint = `${params.baseUrl}/models/${params.model}:generateContent`;
+  let baseUrl = params.baseUrl.trim().replace(/\/$/, "");
   const googleSearch =
     params.timeRangeFilter === undefined ? {} : { timeRangeFilter: params.timeRangeFilter };
+
+  if (params.apiType === "gemini" && baseUrl.endsWith("/openai")) {
+    baseUrl = baseUrl.replace(/\/openai$/, "");
+  }
+
+  if (params.apiType === "openai-compatible") {
+    const endpoint = `${baseUrl}/chat/completions`;
+    return withSelfHostedWebSearchEndpoint(
+      {
+        url: endpoint,
+        timeoutSeconds: params.timeoutSeconds,
+        signal: params.signal,
+        init: {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${params.apiKey}`,
+            ...params.headers,
+          },
+          body: JSON.stringify({
+            model: params.model,
+            messages: [{ role: "user", content: params.query }],
+            // LiteLLM and Vertex AI expect "googleSearch" instead of "google_search" in OpenAI-compatible payloads
+            tools: [{ googleSearch }],
+          }),
+        },
+      },
+      async (res) => {
+        if (!res.ok) {
+          const detail = (await res.text()) || res.statusText;
+          throw new Error(`OpenAI-compatible API error (${res.status}) at ${endpoint}: ${detail}`);
+        }
+        const data = (await res.json()) as OpenAICompatibleChatResponse;
+        if (data.error) {
+          throw new Error(`API error: ${data.error.message}`);
+        }
+
+        const choice = data.choices?.[0];
+        const content = choice?.message?.content ?? "No response";
+        const groundingChunks =
+          data.grounding_metadata?.groundingChunks ??
+          data.candidates?.[0]?.groundingMetadata?.groundingChunks ??
+          [];
+        const rawCitations = groundingChunks
+          .filter((chunk) => chunk.web?.uri)
+          .map((chunk) => ({
+            url: chunk.web!.uri!,
+            title: chunk.web?.title || undefined,
+          }));
+
+        const citations: Array<{ url: string; title?: string }> = [];
+        for (let index = 0; index < rawCitations.length; index += 10) {
+          const batch = rawCitations.slice(index, index + 10);
+          const resolved = await Promise.all(
+            batch.map(async (citation) =>
+              Object.assign({}, citation, { url: await resolveCitationRedirectUrl(citation.url) }),
+            ),
+          );
+          citations.push(...resolved);
+        }
+        return { content, citations };
+      },
+    );
+  }
+
+  const endpoint = `${baseUrl}/models/${params.model}:generateContent`;
   const headers = buildGeminiRequestHeaders({
     apiKey: params.apiKey,
-    baseUrl: params.baseUrl,
+    baseUrl,
     operatorHeaders: params.headers,
   });
 
-  return withTrustedWebSearchEndpoint(
+  return withSelfHostedWebSearchEndpoint(
     {
       url: endpoint,
       timeoutSeconds: params.timeoutSeconds,
@@ -278,7 +375,7 @@ async function runGeminiSearch(params: {
         method: "POST",
         headers,
         body: JSON.stringify({
-          contents: [{ parts: [{ text: params.query }] }],
+          contents: [{ role: "user", parts: [{ text: params.query }] }],
           tools: [{ google_search: googleSearch }],
         }),
       },
@@ -431,6 +528,7 @@ export async function executeGeminiSearch(
   });
   const model = resolveGeminiModel(geminiConfig);
   const baseUrl = resolveGeminiBaseUrl(geminiConfig);
+  const apiType = resolveGeminiApiType(geminiConfig);
   const headers = resolveGeminiWebSearchHeaders(geminiConfig);
   const headersCacheKey = headers
     ? createHash("sha256")
@@ -445,6 +543,7 @@ export async function executeGeminiSearch(
     "gemini",
     query,
     baseUrl,
+    apiType,
     model,
     timeRange.freshness,
     timeRange.dateAfter,
@@ -463,11 +562,13 @@ export async function executeGeminiSearch(
     apiKey,
     baseUrl,
     model,
+    apiType,
     timeoutSeconds: resolveSearchTimeoutSeconds(searchConfig),
     signal: context?.signal,
     timeRangeFilter: timeRange.timeRangeFilter,
     headers,
   });
+
   context?.signal?.throwIfAborted();
   const payload = {
     query,
